@@ -1,6 +1,7 @@
 from .FileTransfer import UpFileClient
 from .GithubDownload import GitHubReleaseFetcher, init_request, GithubRequester, ReleaseInfo, ReleaseAsset
 from .Webnote import Note
+from .GithubCommit import get_recent_commits
 
 __all__ = [
     "UpFileClient",
@@ -9,5 +10,6 @@ __all__ = [
     "GithubRequester",
     "ReleaseInfo",
     "ReleaseAsset",
-    "Note"
+    "Note",
+    "get_recent_commits"
 ]
