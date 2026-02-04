@@ -103,6 +103,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.LCTA_UPLOADER }}
 
       - name: Upload log
+        if: steps.check_folder.outputs.folder_exists == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: applogs
