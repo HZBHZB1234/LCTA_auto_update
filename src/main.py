@@ -14,14 +14,26 @@ print(project_root)
 sys.path.insert(0, str(project_root))
 os.chdir(workdir)
 
-logging.basicConfig(
-    filename='app.log',          # 日志文件名
-    level=logging.DEBUG,         # 日志级别
-    format='%(asctime)s - %(levelname)s'  # 日志格式
-)
+logger = logging.getLogger()
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+file_handler = logging.FileHandler('app.log', encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+
+# 创建控制台处理器
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+
+# 设置格式
+formatter = logging.Formatter(
+    '%(asctime)s - %(levelname)s - %(message)s'
+)
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# 添加处理器到logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+logger.setLevel(logging.DEBUG)
 
 with open("config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
@@ -93,6 +105,9 @@ with tempfile.TemporaryDirectory() as tmpdir:
         with open(tmp / "latest_release.tar.gz", "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
+    
+    # shutil.copy(project_root / '_dev' / 'test.tar.gz',
+    #             tmp / "latest_release.tar.gz")
     
     with tarfile.open(tmp / "latest_release.tar.gz") as tar:
         tar.extractall(path=tmp / "llc")
@@ -224,3 +239,70 @@ with tempfile.TemporaryDirectory() as tmpdir:
                     file_path_config.KR_path.read_text(encoding='utf-8-sig')),
                 CNaffect=json.loads(
                     file_path_config.target_file.read_text(encoding='utf-8-sig')))
+
+    today = datetime.now()
+    current_date = today.strftime("%Y%m%d")  # 格式：YYYYMMDD
+
+    previous_version = this_release.tag_name
+
+    try:
+        # 提取上一个版本号的日期部分和序号部分
+        prev_date = previous_version[:8]  # 前8位是日期
+        prev_sequence = int(previous_version[8:])  # 后2位是序号
+        
+        if prev_date == current_date:
+            # 如果是同一天，序号加1
+            new_sequence = prev_sequence + 1
+            # 确保序号是两位数（01-99）
+            if new_sequence > 99:
+                raise ValueError("当日版本序号已超过99，请使用新的日期")
+            VERSION = f"{current_date}{new_sequence:02d}"
+        else:
+            # 如果是新的一天，从01开始
+            VERSION = f"{current_date}01"
+    except (ValueError, IndexError):
+        print(f"警告: 上一个版本号'{previous_version}'格式不正确，将重置为今天的新版本")
+        VERSION = f"{current_date}01"
+
+    try:
+        Info_path = target_dir / "Info"
+        Info_path.mkdir(parents=True, exist_ok=True)
+        license_project = tmp_base_path / "LICENSE"
+        license_target = Info_path / "LICENSE"
+        shutil.copy(license_project, license_target)
+        version_target = Info_path / "version.json"
+        version_target.write_text(json.dumps(
+            {"version": VERSION, "notice": "本次文本更新没有提示。"},
+            ensure_ascii=False, indent=4))
+    except Exception as e:
+        logger.error('创建版本信息失败')
+        logger.exception(e)
+        
+    try:
+        font_project = tmp_base_path / 'Fonts' / 'ChineseFont.ttf'
+        font_target = target_dir / 'Fonts' / 'Context'
+        font_target.mkdir(parents=True, exist_ok=True)
+        font_target = font_target / 'ChineseFont.ttf'
+        shutil.copy(font_project, font_target)
+    except Exception as e:
+        logger.error('复制字体文件失败')
+        logger.exception(e)
+
+usage = translator.get_performance_metrics()
+
+RELEASE_NOTE = f"""
+{VERSION}版资源更新
+{VERSION} version Resource Update
+
+本次更新开销:
+请求数量: {usage.get('request_count', '获取失败')}
+请求字符数: {usage.get('chars_translated', '获取失败')}
+
+使用LCTA工具箱-启动器以自动进行版本更新
+[项目链接](https://github.com/HZBHZB1234/LCTA-Limbus-company-transfer-auto)
+
+感觉有用就给个star吧
+"""
+
+UPDATE_MARKDOWN = project_root / 'update.md'
+UPDATE_MARKDOWN.write_text(RELEASE_NOTE, encoding='utf-8')

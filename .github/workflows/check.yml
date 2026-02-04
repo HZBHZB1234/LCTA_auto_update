@@ -1,4 +1,4 @@
-name: Check Newest Package
+name: Check And Update LCTA
 
 on:
   # 每小时运行一次（在15分钟时）
@@ -26,17 +26,86 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'  # 指定Python版本
-          cache: 'pip'  # 可选：启用pip缓存加速
+          python-version: '3.9'
+          cache: 'pip'
       
+      # 3. 安装依赖
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests pyyaml
       
-      # 4. 运行脚本
+      # 4. 运行Python脚本
       - name: Run Python script
         env:
-          ADDRESS: ${{ secrets.WEBNOTE_ADDRESS }}
+          DEEPSEEK: ${{ secrets.DEEPSEEK }}
+          LCTA_FETCHER: ${{ secrets.LCTA_FETCHER }}
         run: |
-          python .github/UpdatePackage.py
+          python ./src/main.py
+      
+      # 5. 检查LLc-CN-LCTA文件夹是否存在
+      - name: Check if LLc-CN-LCTA exists
+        id: check_folder
+        run: |
+          if [ -d "LLc-CN-LCTA" ]; then
+            echo "LLc-CN-LCTA folder exists"
+            echo "folder_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "LLc-CN-LCTA folder does not exist"
+            echo "folder_exists=false" >> $GITHUB_OUTPUT
+          fi
+      
+      # 6. 安装7-Zip（仅在需要打包时）
+      - name: Install 7-Zip if needed
+        if: steps.check_folder.outputs.folder_exists == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+      
+      # 7. 打包LLc-CN-LCTA文件夹
+      - name: Package LLc-CN-LCTA
+        if: steps.check_folder.outputs.folder_exists == 'true'
+        id: package
+        run: |
+          echo "LLc-CN-LCTA folder exists, packaging..."
+          
+          # 获取版本号
+          if [ -f "LLc-CN-LCTA/Info/version.json" ]; then
+            VERSION=$(python -c "import json; data=json.load(open('LLc-CN-LCTA/Info/version.json')); print(data.get('version', 'unknown'))")
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+          else
+            VERSION=$(date +"%Y%m%d")
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+          fi
+          
+          # 创建ZIP包
+          zip -r "LLc-CN-LCTA-$VERSION.zip" LLc-CN-LCTA/
+          
+          # 创建7Z包
+          7z a -t7z "LLc-CN-LCTA-$VERSION.7z" LLc-CN-LCTA/
+          
+          echo "packages_created=true" >> $GITHUB_OUTPUT
+      
+      # 8. 创建或更新Release
+      - name: Create or Update Release
+        if: steps.package.outputs.packages_created == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "LCTA Release ${{ env.VERSION }}"
+          body_path: ./update.md
+          files: |
+            LLc-CN-LCTA-${{ env.VERSION }}.zip
+            LLc-CN-LCTA-${{ env.VERSION }}.7z
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.LCTA_UPLOADER }}
+
+      - name: Upload log
+        uses: actions/upload-artifact@v4
+        with:
+          name: applogs
+          path: |
+            ./src/app.log
+          retention-days: 7
