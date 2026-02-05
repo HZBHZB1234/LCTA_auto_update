@@ -920,6 +920,7 @@ class FileProcessor:
             translated_text = builder.deBuild(result)
         except StopIteration:
             self.logger.warning(f"翻译结果还原时出现问题：返回值长度问题")
+            self._save_except()
             raise ProcesserExit("translation_length_error")
         
         self._de_get_translating_text(translated_text)
@@ -953,6 +954,7 @@ class FileProcessor:
         except json.JSONDecodeError:
             self.logger.warning(f"{self.path_config.real_name}文件解析错误，跳过")
             self._save_except()
+            raise ProcesserExit("json_decode_error")
 
     def _save_llc(self):
         shutil.copy2(self.path_config.LLC_path, self.path_config.target_file)
@@ -967,8 +969,6 @@ class FileProcessor:
         shutil.copy2(self.path_config.KR_path, self.path_config.target_file)
         
     def _save_except(self):
-        if not self.request_config.save_result:
-            raise ProcesserExit("no_save_except")
         try:
             self._save_llc()
         except:
@@ -983,7 +983,6 @@ class FileProcessor:
                     except:
                         self.logger.error(f"保存文件{self.path_config.real_name}，请检查文件路径")
                         raise ProcesserExit("save_except_except")
-        raise ProcesserExit("save_except_success")
     
     def _save_result(self, json_data):
         if not self.request_config.save_result:

@@ -124,7 +124,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
             "base_url": "https://api.deepseek.com/v1",
             "model_name": "deepseek-chat",
             "temperature": 1.0,
-            "max_tokens": 6000,
+            "max_tokens": 8000,
             "top_p": 1.0,
             "frequency_penalty": 0.0,
             "presence_penalty": 0.0,
@@ -133,7 +133,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
         },
         debug_mode=True,
         enable_cache=True,
-        enable_metrics=True
+        enable_metrics=True,
+        text_max_length=20000
     )
     
     translator: TranslatorBase = LLMGeneralTranslator(
@@ -198,9 +199,12 @@ with tempfile.TemporaryDirectory() as tmpdir:
         )
         
         try:
-            processer.process_file()
-        except ProcesserExit as e:
-            logger.info(f"文件{file_path_config.rel_path}处理完毕，退出码{e.exit_type} ")
+            try:
+                processer.process_file()
+            except ProcesserExit as e:
+                logger.info(f"文件{file_path_config.rel_path}处理完毕，退出码{e.exit_type} ")
+                if e.exit_type == 'translation_length_error':
+                    raise
         except Exception as e:
             logger.error(f"文件{file_path_config.rel_path}处理出错，错误信息：{e}")
             logger.exception(e)
