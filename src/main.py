@@ -38,6 +38,11 @@ logger.setLevel(logging.DEBUG)
 with open("config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
 
+print(f'环境变量FORCE_RUN为{os.getenv("FORCE_RUN")}')
+FORCE_RUN = False if os.getenv("FORCE_RUN") == "False" else True
+if FORCE_RUN:
+    print('强制运行')
+
 from webFunc import get_recent_commits, GitHubReleaseFetcher
 
 llcCommit = get_recent_commits(
@@ -56,7 +61,8 @@ for commit in llcCommit:
         break
 else:
     logger.info("未检测到自动RAW更新提交，程序结束。")
-    sys.exit(0)
+    if not FORCE_RUN:
+        sys.exit(0)
     
 commit_time = commit['date']
 commit_time = datetime.fromisoformat(commit_time.replace('Z', '+00:00'))
@@ -76,7 +82,8 @@ except:
 
 if commit_time <= record_time:
     logger.info("没有新的更新提交，程序结束。")
-    sys.exit(0)
+    if not FORCE_RUN:
+        sys.exit(0)
 
 release = release_fetcher.get_latest_release(
     "LocalizeLimbusCompany", "LocalizeLimbusCompany")

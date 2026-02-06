@@ -6,6 +6,12 @@ on:
     - cron: '15 * * * *'
   # 允许手动触发
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force Run'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-script:
@@ -40,6 +46,7 @@ jobs:
         env:
           DEEPSEEK: ${{ secrets.DEEPSEEK }}
           LCTA_FETCHER: ${{ secrets.LCTA_FETCHER }}
+          FORCE_RUN: ${{ inputs.force_run || 'false' }}
         run: |
           python ./src/main.py
       
