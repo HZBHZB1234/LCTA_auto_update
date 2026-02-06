@@ -1,7 +1,7 @@
 import requests
 import sys
 
-def fetch():
+def fetch(min_len:int = 0):
     data = []
     for i in range(10):
         r=requests.get(f"https://paratranz.cn/api/projects/6860/terms?pageSize=800&page={i+1}",timeout=10)
@@ -19,6 +19,6 @@ def fetch():
             'term': i.get('term', ''),
             'translation': i.get('translation', ''),
             'note': i.get('note', '')
-        } for i in data
+        } for i in data if len(i.get('term', '')) >= min_len
     ]
     return result

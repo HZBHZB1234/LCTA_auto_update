@@ -565,7 +565,7 @@ class RequestTextBuilder:
         # 技能文档参考
         if self.request_config.is_skill and reference.get('skill_doc'):
             result_lines.extend(self._format_section("技能翻译指南", [
-                self._escape_text(reference['skill_doc'])
+                reference['skill_doc']
             ]))
         
         # 添加分隔线
@@ -575,12 +575,12 @@ class RequestTextBuilder:
         
         # 添加文本块
         text_blocks = texts.get('text_blocks', [])
-        for block in text_blocks:
+        for idx, block in enumerate(text_blocks):
             # 添加文本块分隔符
-            if block['id'] > 1:
+            if idx > 0:
                 result_lines.append("\n" + "-" * 20 + "\n")
             
-            result_lines.append(f"【文本块 {block['id']}】")
+            result_lines.append(f"【文本块 {idx+1}】")
             
             # 核心文本内容
             core_lines = [
@@ -606,7 +606,7 @@ class RequestTextBuilder:
                 model_content = f"{model} / {reference.get('models', {}).get(model, {}).get('cn', '获取失败')}"
                 result_lines.extend(self._format_section("说话者信息", [model_content], level=2))
             
-            result_lines.append(f"【文本块 {block['id']} 结束】")
+            result_lines.append(f"【文本块 {idx+1} 结束】")
         
         # 添加整体结束标记
         if text_blocks:
@@ -990,8 +990,9 @@ class FileProcessor:
         try:
             with open(self.path_config.target_file, 'w', encoding='utf-8-sig') as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=4)
+                raise ProcesserExit("success_save")
         except:
-            raise ProcesserExit("success_save")
+            raise ProcesserExit("success_save_error")
             
     def _check_empty(self):
         if self.kr_json in EMPTY_DATA or self.kr_json.get('dataList', []) in EMPTY_DATA_LIST:

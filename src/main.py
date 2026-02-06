@@ -81,17 +81,22 @@ except:
     sys.exit(1)
 
 if commit_time <= record_time:
-    logger.info("没有新的更新提交，程序结束。")
     if not FORCE_RUN:
+        logger.info("没有新的更新提交，程序结束。")
         sys.exit(0)
+    else:
+        logger.info("没有新的更新提交，强制运行")
 
 release = release_fetcher.get_latest_release(
     "LocalizeLimbusCompany", "LocalizeLimbusCompany")
 release_time = datetime.fromisoformat(release.published_at.replace('Z', '+00:00'))
 
 if release_time >= commit_time:
-    logger.info("没有新的更新提交，程序结束。")
-    sys.exit(0)
+    if not FORCE_RUN:
+        logger.info("没有新的更新提交，程序结束。")
+        sys.exit(0)
+    else:
+        logger.info("没有新的更新提交，强制运行")
     
 import tarfile
 import requests
@@ -189,7 +194,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     
     matcher = MatcherOrganizer()
     
-    matcher.update_proper(fetch_proper())
+    matcher.update_proper(fetch_proper(2))
     
     for file in target_files:
         file_path_config = FilePathConfig(
@@ -220,12 +225,11 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 translator.update_config(
                     system_prompt=JSON_SYSTEM_PROMPT if is_text else TEXT_SYSTEM_PROMPT,
                     response_format="json_object" if is_text else "text")
-                cache_request_config = deepcopy(request_config)
-                cache_request_config.is_text_format = not is_text
+                request_config.is_text_format = not is_text
                 processer = FileProcessor(
                     path_config=file_path_config,
                     matcher=matcher,
-                    request_config=cache_request_config,
+                    request_config=request_config,
                     logger=logger
                 )
                 try:
@@ -239,6 +243,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
                 translator.update_config(
                     system_prompt=TEXT_SYSTEM_PROMPT if is_text else JSON_SYSTEM_PROMPT,
                     response_format="text" if is_text else "json_object")
+                request_config.is_text_format = is_text
         if file_path_config.KR_path == model_file:
             matcher.update_models(kr_role=json.loads(
                     file_path_config.KR_path.read_text(encoding='utf-8-sig')),
@@ -291,7 +296,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         
     try:
         font_project = tmp_base_path / 'Fonts' / 'ChineseFont.ttf'
-        font_target = target_dir / 'Fonts' / 'Context'
+        font_target = target_dir / 'Font' / 'Context'
         font_target.mkdir(parents=True, exist_ok=True)
         font_target = font_target / 'ChineseFont.ttf'
         shutil.copy(font_project, font_target)
