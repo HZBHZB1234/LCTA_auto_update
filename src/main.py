@@ -39,7 +39,7 @@ with open("config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
 
 print(f'环境变量FORCE_RUN为{os.getenv("FORCE_RUN")}')
-FORCE_RUN = False if os.getenv("FORCE_RUN") == "False" else True
+FORCE_RUN = False if os.getenv("FORCE_RUN") == "false" else True
 if FORCE_RUN:
     print('强制运行')
 
