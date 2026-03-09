@@ -1,6 +1,8 @@
 # LCTA 自动汉化发布工具
 
-LCTA（Localize-Compile-Translate-Automate）是一个基于 GitHub Actions 的自动汉化发布脚本，用于自动获取、翻译并发布汉化文件，助力本地化工作流程自动化。  
+LCTA（Limbus-Company-Transfer-Auto）是一个基于 GitHub Actions 的自动汉化发布脚本，用于自动获取、翻译并发布汉化文件，助力本地化工作流程自动化。  
+
+<img src='https://moe.8845.top/get/?name=LCTA&theme=moebooru'></img>
 
 [旧版README](https://github.com/HZBHZB1234/LCTA_auto_update/blob/main/docs/README_origin.md)  [Englisg ver](https://github.com/HZBHZB1234/LCTA_auto_update/blob/main/docs/README_en.md)
 
