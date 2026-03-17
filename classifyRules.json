@@ -1,0 +1,22 @@
+{
+    "角色语音": "AbDlg_*.json",
+    "战斗事件": "AbEvents*.json",
+    "观察记录": "AbnormalityGuides*.json",
+    "镜牢事件": "ActionEvents*.json",
+    "播报员名称*": "Announcer*.json",
+    "播报员事件**": "AnnouncerVoiceType.json",
+    "援助单位名称*": "Assist-*.json",
+    "体力完备报告**": "AttendanceRewardsText.json",
+    "罪孽名称**": "AttributeText.json",
+    "战斗小贴士": "BattleHint*.json",
+    "状态效果/战斗术语": "BattleKeywords*.json",
+    "通行证相关": "BattlePass*.json",
+    "战斗失败小贴士": "BattleResultHint*.json",
+    "气泡文本": "BattleSpeechBubbleDlg*.json",
+    "战斗ui文本**": "BattleUIText.json",
+    "状态效果详细描述": "Buf*.json",
+    "第八章特殊文本*": "Ch8*.json",
+    "我方角色映射**": "Characters.json",
+    "事件选项相关": "Choice*.json",
+    "兑换码相关**": "CouponUIText.json"
+}

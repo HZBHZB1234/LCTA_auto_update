@@ -11,7 +11,7 @@ EMPTY_TEXT = ['', '-']
 AVOID_PATH = ['usage', 'id', 'model']
 
 def getDataKey(key: tuple) -> str:
-    return '.'.join([i if isinstance(key, str) else 'num' for i in key])
+    return '.'.join([i if isinstance(i, str) else 'num' for i in key])
 
 class FileAnalyzer():
     def __init__(self, filePathConfig: FilePathConfig):
@@ -54,12 +54,14 @@ class FileAnalyzer():
         cn = word['translation']
         for path, value in self._flat.items():
             dataKey = getDataKey(path)
-            result[dataKey]['len'] = result.get(dataKey, {}).get('len', 0)+1
+            # 确保 result[dataKey] 存在
+            entry = result.setdefault(dataKey, {'len': 0, 'all': 0, 'fit': 0})
+            entry['len'] += 1
             if kr in value:
-                result[dataKey]['all'] = result.get(dataKey, {}).get('all', 0)+1
+                entry['all'] += 1
                 with suppress(Exception):
                     if cn in self._cnFlat[path]:
-                        result[dataKey]['fit'] = result.get(dataKey, {}).get('all', 0)+1
+                        entry['fit'] += 1
         return result
 
 class FileClassify():
@@ -85,10 +87,7 @@ class ProperAnalyzeMain():
         self.minHit = minHit
         self.maxMiss = maxMiss
         self.devideZero = divideZero
-        self.initVariable(classifyRules)
-
-    def initVariable(self, ruleDict: dict):
-        self.data = {i: dict() for i in ruleDict}
+        self.data = {i: dict() for i in classifyRules}
     
     def load(self):
         for path in self.pathConfig.KR_base_path.rglob('*.json'):
@@ -99,13 +98,16 @@ class ProperAnalyzeMain():
     def analyze(self, word: dict):
         result = {}
         for fileType in self.data:
+            if fileType not in result:
+                result[fileType] = {}
             for file in self.data[fileType]:
-                analizer = self.data[fileType][file]
-                analizeResult = analizer.analyze(word)
-                for key, item in analizeResult.items():
+                analyzer = self.data[fileType][file]
+                analyzeResult = analyzer.analyze(word)
+                for key, item in analyzeResult.items():
+                    if key not in result[fileType]:
+                        result[fileType][key] = {}
                     for _key, _item in item.items():
                         result[fileType][key][_key] = result[fileType][key].get(_key, 0) + _item
-        
         return result
     
     def checkOK(self, statistics: Dict[str, int]):
@@ -124,7 +126,11 @@ class ProperAnalyzeMain():
     def makeIndex(self):
         for word in self.result:
             for fileType in self.result[word]:
+                if fileType not in self.index:
+                    self.index[fileType] = {}
                 for key in self.result[word][fileType]:
+                    if key not in self.index[fileType]:
+                        self.index[fileType][key] = {}
                     self.index[fileType][key][word] = self.result[word][fileType][key]
 
     def init(self, words: List[dict]):
@@ -133,4 +139,8 @@ class ProperAnalyzeMain():
             result = self.analyze(word)
             result = self.preprocess(result)
             self.result[word['term']] = result
+            print(f'处理完成: {word}')
         self.makeIndex()
+    
+    def process(self, propers: List[str], fileType: str, keyPath: str) -> List[str]:
+        return [i for i in propers if self.index[fileType][keyPath][i]]
