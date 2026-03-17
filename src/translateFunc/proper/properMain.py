@@ -39,12 +39,13 @@ class FileAnalyzer():
         self._cnFlat = {i: self._cnFlat[i] for i in self._cnFlat
                        if not (self._cnFlat[i] in EMPTY_TEXT or i[-1] in AVOID_PATH)}
         
-    def analyze(self, word: dict) -> dict:
+    def analyze(self, word: dict) -> Dict[str, Dict[str, int]]:
         '''
         {
-            (keys, ): {
-                'all': '',
-                'fit': ''
+            'key.num': {
+                'all': 1,
+                'fit': 2,
+                'len': 3
             }
         }
         '''
@@ -52,8 +53,9 @@ class FileAnalyzer():
         kr = word['term']
         cn = word['translation']
         for path, value in self._flat.items():
+            dataKey = getDataKey(path)
+            result[dataKey]['len'] = result.get(dataKey, {}).get('len', 0)+1
             if kr in value:
-                dataKey = getDataKey(path)
                 result[dataKey]['all'] = result.get(dataKey, {}).get('all', 0)+1
                 with suppress(Exception):
                     if cn in self._cnFlat[path]:
@@ -76,7 +78,7 @@ class ProperAnalyzeMain():
         self.pathConfig = pathConfig
         self.hasPrefix = hasPrefix
         self.fileClassify = FileClassify(classifyRules)
-        self.data = dict()
+        self.data: Dict[str, Dict[str, FileAnalyzer]] = dict()
         self.result = dict()
     
     def load(self):
@@ -89,3 +91,10 @@ class ProperAnalyzeMain():
         for fileType in self.data:
             for file in self.data[fileType]:
                 filePathConfig = FilePathConfig(file, self.pathConfig, self.hasPrefix)
+                analizer = self.data[fileType][file]
+                analizeResult = analizer.analyze(word)
+                for key, item in analizeResult.items():
+                    for _key, _item in item.items():
+                        self.result[fileType][key][_key] = self.result[fileType][key].get(_key) + _item
+        
+        return self.result
