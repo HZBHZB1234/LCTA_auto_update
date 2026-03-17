@@ -1,0 +1,16 @@
+{
+    "角色语音": "AbDlg_.*\\.json",
+    "战斗事件": "AbEvents.*\\.json",
+    "观察记录": "AbnormalityGuides.*\\.json",
+    "镜牢事件": "ActionEvents.*\\.json",
+    "战斗小贴士": "BattleHint.*\\.json",
+    "状态效果/战斗术语": "BattleKeywords.*\\.json",
+    "气泡文本": "BattleSpeechBubbleDlg.*\\.json",
+    "状态效果详细描述": "Buf.*\\.json",
+    "事件选项相关": "Choice.*\\.json",
+    "迷宫相关": "Dungeon.*\\.json",
+    "ego饰品相关": "EGOgift_.*\\.json",
+    "敌方单位": "Enemies.*\\.json",
+    "技能": "Skill.*\\.json",
+    "杂项": ".*\\.json"
+}

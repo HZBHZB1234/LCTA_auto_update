@@ -74,27 +74,63 @@ class FileClassify():
                 return typeId
         
 class ProperAnalyzeMain():
-    def __init__(self, pathConfig: PathConfig, hasPrefix: bool, classifyRules: dict):
+    def __init__(self, pathConfig: PathConfig, hasPrefix: bool, classifyRules: dict,
+                 minHit: float = 0.8, maxMiss: float = 0.0, divideZero: bool = True):
         self.pathConfig = pathConfig
         self.hasPrefix = hasPrefix
         self.fileClassify = FileClassify(classifyRules)
         self.data: Dict[str, Dict[str, FileAnalyzer]] = dict()
         self.result = dict()
+        self.index = dict()
+        self.minHit = minHit
+        self.maxMiss = maxMiss
+        self.devideZero = divideZero
+        self.initVariable(classifyRules)
+
+    def initVariable(self, ruleDict: dict):
+        self.data = {i: dict() for i in ruleDict}
     
     def load(self):
         for path in self.pathConfig.KR_base_path.rglob('*.json'):
             filePathConfig = FilePathConfig(path, self.pathConfig, self.hasPrefix)
             fileType = self.fileClassify.classify(filePathConfig.rel_path)
-            self.data[fileType][filePathConfig.KR_path] = FileAnalyzer(filePathConfig)
+            self.data[fileType][str(filePathConfig.rel_path)] = FileAnalyzer(filePathConfig)
     
     def analyze(self, word: dict):
+        result = {}
         for fileType in self.data:
             for file in self.data[fileType]:
-                filePathConfig = FilePathConfig(file, self.pathConfig, self.hasPrefix)
                 analizer = self.data[fileType][file]
                 analizeResult = analizer.analyze(word)
                 for key, item in analizeResult.items():
                     for _key, _item in item.items():
-                        self.result[fileType][key][_key] = self.result[fileType][key].get(_key) + _item
+                        result[fileType][key][_key] = result[fileType][key].get(_key, 0) + _item
         
-        return self.result
+        return result
+    
+    def checkOK(self, statistics: Dict[str, int]):
+        _len = statistics.get('len', 0)
+        _all = statistics.get('all', 0)
+        _fit = statistics.get('fit', 0)
+        if _all == 0:
+            return self.devideZero
+        return _fit/_all >= self.minHit and _all/_len <= self.maxMiss
+    
+    def preprocess(self, result: Dict[str, Dict[str, Dict[str, int]]]) -> Dict[str, Dict[str, bool]]:
+        for fileType in result:
+            result[fileType] = {key: self.checkOK(item) for key, item in result[fileType].items()}
+        return result
+    
+    def makeIndex(self):
+        for word in self.result:
+            for fileType in self.result[word]:
+                for key in self.result[word][fileType]:
+                    self.index[fileType][key][word] = self.result[word][fileType][key]
+
+    def init(self, words: List[dict]):
+        self.load()
+        for word in words:
+            result = self.analyze(word)
+            result = self.preprocess(result)
+            self.result[word['term']] = result
+        self.makeIndex()
