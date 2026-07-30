@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-import json
 from pathlib import Path
+import yaml
 import zipfile
 
 import pytest
@@ -22,7 +22,7 @@ from auto_update.versioning import is_version_tag, next_version
 
 
 def test_default_config_loads():
-    config_path = Path(__file__).resolve().parents[1] / "src" / "config.json"
+    config_path = Path(__file__).resolve().parents[1] / "src" / "config.yaml"
     config = AppConfig.load(config_path)
 
     assert config.sources.raw_languages == ("jp", "kr", "en")
@@ -34,12 +34,12 @@ def test_default_config_loads():
 
 
 def test_config_rejects_disabled_package_formats(tmp_path):
-    source = Path(__file__).resolve().parents[1] / "src" / "config.json"
-    data = json.loads(source.read_text(encoding="utf-8"))
+    source = Path(__file__).resolve().parents[1] / "src" / "config.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
     data["publishing"]["zip"] = False
     data["publishing"]["seven_zip"] = False
-    config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps(data), encoding="utf-8")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.dump(data, default_flow_style=False), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="不能同时关闭"):
         AppConfig.load(config_path)

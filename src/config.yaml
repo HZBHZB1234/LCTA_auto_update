@@ -1,0 +1,133 @@
+# ============================================================
+# LCTA 自动更新系统 — 全局配置文件
+# ============================================================
+
+# ---------- 源数据配置 ----------
+sources:
+  # 边狱文件状态 API，用于获取最新资源 token
+  status_url: "https://limbus-api.voidfissure.de/api/status"
+
+  # 原始语言包下载地址模板
+  # {token} 会自动替换为从 status_url 获取的 token
+  # {lang}  会自动替换为 raw_languages 中的语言代码
+  raw_url_template: "https://downloadcommon.limbuscompanycdn.org/{token}/Assets/LocalizePatch/localize_{lang}.zip"
+
+  # 需要下载的原始语言列表
+  raw_languages:
+    - jp
+    - kr
+    - en
+
+  # 已翻译文本的 GitHub 仓库
+  cooked_repository: "LocalizeLimbusCompany/LocalizeLimbusCompany"
+
+# ---------- 网络连接配置 ----------
+network:
+  # 建立 TCP 连接的超时时间（秒）
+  connect_timeout: 15
+
+  # 读取响应的超时时间（秒）
+  read_timeout: 180
+
+  # 请求失败时的最大重试次数
+  retries: 3
+
+  # GitHub API Token 的环境变量名
+  github_token_env: "LCTA_FETCHER"
+
+# ---------- 翻译服务配置 ----------
+translation:
+  # 翻译服务名称（仅用于日志标识）
+  translator_name: "LLM通用翻译服务"
+
+  # API Key 对应的环境变量名
+  api_key_env: "DEEPSEEK"
+
+  # LLM API 调用参数
+  api:
+    base_url: "https://api.deepseek.com/v1"
+    model_name: "deepseek-v4-pro"
+    temperature: 1.0
+    max_tokens: 8000
+    top_p: 1.0
+    frequency_penalty: 0.0
+    presence_penalty: 0.0
+
+  # 源语言代码（EN / JP / KR 之一）
+  from_lang: "EN"
+
+  # 专有名词词典路径（为空字符串则使用内置词典）
+  proper_path: ""
+
+  # 并发翻译的最大线程数（1 ~ 32）
+  max_workers: 4
+
+  # 翻译模式：multi_stage（多阶段）/ single_stage（单阶段）
+  translation_mode: "multi_stage"
+
+  # 消歧模式：similarity（相似度）/ llm（大模型）/ hybrid（混合）
+  disambiguation_mode: "hybrid"
+
+  # 最低置信度阈值：high / medium / low
+  min_confidence: "low"
+
+  # 提示词格式：xml_json / xml_xml / json_json
+  prompt_format: "xml_json"
+
+# ---------- 功能开关 ----------
+features:
+  # 总开关：关闭后跳过所有自动更新流程
+  enabled: true
+
+  # 对相同 token 的去重：已处理过的 token 不再重复处理
+  deduplicate: true
+
+  # 启用专有名词翻译
+  enable_proper: true
+
+  # 自动从远程获取最新专有名词词典
+  auto_fetch_proper: true
+
+  # 启用角色名翻译
+  enable_role: true
+
+  # 启用技能名翻译
+  enable_skill: true
+
+  # 启用并发翻译
+  enable_concurrent: true
+
+  # 启用翻译结果自检
+  enable_self_check: false
+
+  # 启用规则验证
+  enable_rule_validation: true
+
+  # 启用思维链推理（仅部分模型支持）
+  enable_thinking: false
+
+  # 翻译失败时回退到原文
+  fallback: true
+
+  # 调试模式：输出更详细的日志
+  debug_mode: true
+
+  # 保留中间临时文件用于排查
+  dump: true
+
+# ---------- 发布包配置 ----------
+publishing:
+  # 是否生成 .zip 压缩包
+  zip: true
+
+  # 是否生成 .7z 压缩包
+  seven_zip: true
+
+  # 压缩包内文件的根目录名
+  output_dir: "LLc-CN-LCTA"
+
+  # 发布包的文件名前缀
+  asset_prefix: "LLc-CN-LCTA"
+
+  # 上传诊断信息到 GitHub Release body
+  upload_diagnostics: true

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+import yaml
 
 
 class ConfigError(ValueError):
@@ -82,11 +82,11 @@ class AppConfig:
     @classmethod
     def load(cls, path: Path) -> "AppConfig":
         try:
-            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise ConfigError(f"配置文件不存在: {path}") from exc
-        except json.JSONDecodeError as exc:
-            raise ConfigError(f"配置文件不是有效 JSON: {exc}") from exc
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"配置文件不是有效 YAML: {exc}") from exc
 
         if not isinstance(raw, dict):
             raise ConfigError("配置文件根节点必须是对象")

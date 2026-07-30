@@ -38,7 +38,7 @@ def configure_logging() -> None:
 def main() -> int:
     configure_logging()
     config_path = Path(
-        os.getenv("LCTA_CONFIG", str(SOURCE_ROOT / "config.json"))
+        os.getenv("LCTA_CONFIG", str(SOURCE_ROOT / "config.yaml"))
     )
     try:
         config = AppConfig.load(config_path)

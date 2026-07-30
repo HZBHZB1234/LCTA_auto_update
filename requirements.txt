@@ -1,2 +1,3 @@
 translatekit
 requests>=2.32,<3
+pyyaml>=6,<7
