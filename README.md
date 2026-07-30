@@ -1,56 +1,73 @@
-# LCTA 自动汉化发布工具
+# LCTA Auto Update
 
-LCTA（Limbus-Company-Transfer-Auto）是一个基于 GitHub Actions 的自动汉化发布脚本，用于自动获取、翻译并发布汉化文件，助力本地化工作流程自动化。  
+LCTA Auto Update 是 `LCTA-Limbus-company-transfer-auto` 翻译模块的 GitHub Actions 封装。项目在官方生肉更新后自动下载 JP、KR、EN 文本，结合都市零协会最新正式 Release 中的熟肉，补全翻译并发布 `LLc-CN-LCTA` 汉化包。
 
-<img src='https://moe.8845.top/get/?name=LCTA&theme=moebooru'></img>
+## 更新流程
 
-[旧版README](https://github.com/HZBHZB1234/LCTA_auto_update/blob/main/docs/README_origin.md)  [Englisg ver](https://github.com/HZBHZB1234/LCTA_auto_update/blob/main/docs/README_en.md)
+1. voidfissure 在源更新后发送 `repository_dispatch` 事件 `voidfissure_update`。
+2. 工作流请求 `https://limbus-api.voidfissure.de/api/status`，读取 `latest_token.token`。
+3. 使用 token 下载三个官方生肉 ZIP：
+   - `localize_jp.zip`
+   - `localize_kr.zip`
+   - `localize_en.zip`
+4. 获取 `LocalizeLimbusCompany/LocalizeLimbusCompany` 最新正式 Release 的源码快照，以 `LLC_zh-CN` 作为熟肉输入。
+5. 运行从 LCTA 工具箱同步的新版 `TranslationPipeline`。
+6. 生成 ZIP/7Z、运行摘要和 Release 说明，并发布或覆盖对应 Release。
 
-## ✨ 功能特点
+工作流不再包含定时轮询。仍可通过 GitHub Actions 页面手动执行；手动执行遇到相同 raw token 时会重建并覆盖原 Release。
 
-- 🔄 自动从 [都市零协会汉化组](https://github.com/LocalizeLimbusCompany/LocalizeLimbusCompany) 同步最新汉化资源与原文
-- 🛠️ 自动生成汉化文件，支持版本管理与发布
-- 🚀 基于 GitHub Actions 实现全流程自动化，无需手动干预
-- 📦 自动发布至 Releases，提供稳定下载渠道
+## Release 版本
 
-## 📥 获取汉化文件
+tag 完全保留旧版日期加次数规则：
 
-您可以直接在 [**最新 Release**](https://github.com/LocalizeLimbusCompany/LCTA_auto_update/releases/latest) 页面下载最新版本的汉化文件。
+- 格式为 `YYYYMMDDNN`，日期使用北京时间。
+- 当天首次发布使用 `01`。
+- 当天后续发布在上一个正式 Release tag 的序号上加一。
+- 跨日重新从 `01` 开始。
+- 手动重建相同 raw token 时复用原 tag，不产生新版本。
 
-## 🛠️ 使用方式
+`LLc-CN-LCTA/Info/version.json` 会记录版本、raw token、生肉创建时间、熟肉 Release 和生成时间。相同 token 的自动触发通过 Release 说明中的隐藏元数据去重。
 
-本项目完全自动化运行，无需用户手动配置或执行脚本。每一小时，GitHub Actions 将自动触发流程，检查是否存在新更新。如有，生成新的汉化文件并发布至 Release。
+## 配置
 
-## 🌟 相关项目
+主要配置位于 `src/config.json`：
 
-- [都市零协会汉化组](https://github.com/LocalizeLimbusCompany/LocalizeLimbusCompany)：都市零协会的汉化资源与原文。  
-- [LCTA工具箱](https://github.com/HZBHZB1234/LCTA-Limbus-company-transfer-auto)：以翻译为主的边狱公司工具箱。包含启动器，汉化包管理，汉化包自动更新，目录迁移，缓存数据清理等多种功能，可自动评估并进行汉化更新(包括此项目)
+- `sources`：status API、生肉下载模板、语言和熟肉仓库。
+- `network`：超时、重试和 GitHub token 环境变量名。
+- `translation`：翻译器、模型、API key 环境变量、并发和提示格式。
+- `features`：翻译管线各功能、幂等检查、回退、调试和 dump 开关。
+- `publishing`：ZIP、7Z、输出目录、资产前缀和诊断 artifact 开关。
 
-## 📄 许可证说明
+敏感值必须通过环境变量提供，默认使用：
 
-- 本项目源代码及脚本遵循 **[MIT 协议](https://github.com/LocalizeLimbusCompany/LCTA_auto_update/blob/main/LICENSE)**。
-- 所有通过本工具发布的汉化文件，其内容源自 [都市零协会汉化组](https://github.com/LocalizeLimbusCompany/LocalizeLimbusCompany)，遵循 **[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans)** 协议进行分发。
+- `DEEPSEEK`：翻译 API key。
+- `LCTA_FETCHER`：可选的 GitHub API token；未配置时使用 Actions 的 `GITHUB_TOKEN`。
 
-## 🌍 支持更多语言（二次开发）
+## Webhook 对接
 
-LCTA 设计上支持为多种语言构建自动翻译流程。目前优先实现了中文汉化的自动化，但框架本身具备扩展性。
+外部服务需要调用 GitHub repository dispatch API：
 
-如果您希望为您的语言创建自动翻译流程，欢迎：
+```http
+POST /repos/HZBHZB1234/LCTA_auto_update/dispatches
+Authorization: Bearer <GitHub token>
+Accept: application/vnd.github+json
+Content-Type: application/json
 
-- 📌 提交 [Issue](https://github.com/LocalizeLimbusCompany/LCTA_auto_update/issues) 说明需求
-- 🔧 提交 Pull Request 实现对应语言的支持
-- 💬 与作者联系，讨论协作可能性  
-
-在其他语言的具体实现中，可以部分参考 [LCTA工具箱](https://github.com/HZBHZB1234/LCTA-Limbus-company-transfer-auto) 的汉化部分实现。
-
-## 📁 项目结构
-
+{"event_type":"voidfissure_update"}
 ```
-LCTA_auto_update/
-├── .github/workflows/   # GitHub Actions 自动化流程
-├── docs/                # 文档
-├── src/                 # 项目脚本代码
-├── .gitignore           # Git 忽略文件
-├── requirements.txt     # 项目依赖包
-└── README.md            # 项目说明文档
+
+dispatch payload 中不需要携带 raw token。脚本始终重新请求 status API，并以其响应作为权威版本。
+
+## 本地验证
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest
+python src/main.py
 ```
+
+直接运行 `src/main.py` 会访问真实数据源并调用翻译 API。仅检查配置和模块时应运行测试，不要执行完整更新。
+
+## 上游同步
+
+`src/translateFunc` 保持与 `LCTA-Limbus-company-transfer-auto/translateFunc` 相同的目录和实现，自动更新适配全部位于 `src/auto_update`。后续更新翻译模块时应优先整体同步该目录，并运行 `tests/upstream` 中移植的上游测试，避免在翻译核心内部加入项目专用逻辑。

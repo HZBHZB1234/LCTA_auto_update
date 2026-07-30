@@ -5,3 +5,8 @@ __pycache__/
 _dev
 LLc-CN-LCTA
 src/app.log
+release-assets/
+run-summary.json
+translation-dump.jsonl
+update.md
+.pytest_cache/
