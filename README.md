@@ -70,13 +70,15 @@ copy tools\default_config.yaml tools\config.yaml
 python tools\status_server.py
 ```
 
-服务会扫描本地游戏安装的 `resources.assets`（路径在 `asset` 配置项，为空则用默认 Steam 路径）提取最新 CDN token，并通过 `GET /api/status` 提供与 voidfissure 相同格式的响应；发现新 token 且文件稳定后自动调用 `repository_dispatch` 触发工作流，已触发过的 token 记录在 `state` 文件，重启不会重复触发。
+服务会按 `schedule` 配置的更新窗口运行（默认每周四北京时间 10:00–13:00，每 15 分钟遍历一次）：每次遍历先执行 steamcmd 更新游戏，再扫描 `resources.assets`（路径在 `asset` 配置项，为空则按 `steamcmd.install_dir` → 默认 Steam 路径解析）提取最新 CDN token，并通过 `GET /api/status` 提供与 voidfissure 相同格式的响应；发现新 token 且文件稳定后自动调用 `repository_dispatch` 触发工作流，已触发过的 token 记录在 `state` 文件，重启不会重复触发。窗口外不运行，但可通过 `POST /api/check` 手动触发一次完整遍历（steamcmd + 扫描 + dispatch），返回 202。
 
 主要配置项：
 
-- `asset`：resources.assets 路径，为空使用默认 Steam 安装路径。
+- `asset`：resources.assets 路径，为空按 `steamcmd.install_dir` → 默认 Steam 安装路径解析。
 - `server`：监听地址与端口。
-- `polling`：轮询间隔，以及新 token 等待文件 mtime 稳定的秒数（避免 Steam 半写入时误触发）。
+- `polling`：新 token 等待 mtime 稳定的秒数（避免 steamcmd 半写入时误触发）。
+- `schedule`：更新窗口——`update_dow`（0=周一，默认 3=周四）、`start_hour`/`end_hour`（北京时间，默认 10–13）、`interval`（窗口内遍历间隔，默认 900 秒）；`enabled: false` 则始终按 `interval` 遍历。
+- `steamcmd`：`path`（可执行文件路径，为空则不执行）、`app_id`（默认 1973530）、`install_dir`（为空用 steamcmd 默认安装位置，否则 `+force_install_dir`）、`login`（默认 anonymous）、`timeout`。
 - `github`：目标仓库、event_type 与 token（token 只填写在本地 config.yaml）。
 - `state`：已 dispatch 的 token 记录文件。
 - `dispatch`：发现新 token 时是否自动调用 repository_dispatch；为 true 而 token 为空时启动报错。

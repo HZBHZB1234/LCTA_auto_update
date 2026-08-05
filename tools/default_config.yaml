@@ -5,7 +5,8 @@
 #     copy tools\default_config.yaml tools\config.yaml
 # config.yaml 已加入 .gitignore,不会提交到仓库。
 
-# resources.assets 路径;为空字符串时使用默认 Steam 安装路径
+# resources.assets 路径;为空字符串时按
+# steamcmd.install_dir → Steam 默认路径 的顺序解析
 asset: ""
 
 # ---------- HTTP 服务 ----------
@@ -15,12 +16,39 @@ server:
   # 监听端口
   port: 8080
 
-# ---------- 轮询 ----------
+# ---------- 新 token 确认 ----------
 polling:
-  # 检查 resources.assets 变化的时间间隔(秒)
-  interval: 3600
-  # 新 token 需等待文件 mtime 保持稳定的秒数,避免 Steam 半写入时误触发
+  # 扫描到新 token 后等待 mtime 保持稳定的秒数,避免 steamcmd 半写入时误触发
   stability: 30
+
+# ---------- 更新窗口 ----------
+# 游戏主要在每周四北京时间 11:00 更新,此处从 10:00 开始到 13:00 结束,
+# 每 15 分钟遍历一次(先 steamcmd 更新,再扫描 resources.assets)。
+# 窗口外不运行,保留 POST /api/check 手动触发。
+schedule:
+  # 总开关;关闭后始终按 interval 遍历
+  enabled: true
+  # 星期几(0=周一 ... 3=周四)
+  update_dow: 3
+  # 窗口开始小时(北京时间)
+  start_hour: 10
+  # 窗口结束小时(北京时间,不包含该时刻)
+  end_hour: 13
+  # 窗口内遍历间隔(秒)
+  interval: 900
+
+# ---------- SteamCMD ----------
+steamcmd:
+  # steamcmd 可执行文件路径;为空则不执行 steamcmd
+  path: ""
+  # 游戏 AppID
+  app_id: 1973530
+  # 安装目录;为空使用 steamcmd 默认安装位置,否则使用 +force_install_dir
+  install_dir: ""
+  # 登录方式;免费游戏可使用 anonymous
+  login: "anonymous"
+  # 单次执行超时(秒)
+  timeout: 900
 
 # ---------- GitHub dispatch ----------
 github:
