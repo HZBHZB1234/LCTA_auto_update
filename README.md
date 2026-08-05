@@ -30,7 +30,7 @@ tag 完全保留旧版日期加次数规则：
 
 ## 配置
 
-主要配置位于 `src/config.json`：
+主要配置位于 `src/config.yaml`：
 
 - `sources`：status API、生肉下载模板、语言和熟肉仓库。
 - `network`：超时、重试和 GitHub token 环境变量名。
@@ -57,6 +57,32 @@ Content-Type: application/json
 ```
 
 dispatch payload 中不需要携带 raw token。脚本始终重新请求 status API，并以其响应作为权威版本。
+
+## 自托管状态服务
+
+仓库自带常驻状态服务脚本，可替代 voidfissure 的状态 API 与 dispatch 触发，实现完全自托管：
+
+```powershell
+# 1. 复制默认配置并填写 github.token（config.yaml 已加入 .gitignore，不会提交）
+copy tools\default_config.yaml tools\config.yaml
+
+# 2. 启动（默认读取 tools\config.yaml；可用环境变量 LCTA_STATUS_CONFIG 指定其他路径）
+python tools\status_server.py
+```
+
+服务会扫描本地游戏安装的 `resources.assets`（路径在 `asset` 配置项，为空则用默认 Steam 路径）提取最新 CDN token，并通过 `GET /api/status` 提供与 voidfissure 相同格式的响应；发现新 token 且文件稳定后自动调用 `repository_dispatch` 触发工作流，已触发过的 token 记录在 `state` 文件，重启不会重复触发。
+
+主要配置项：
+
+- `asset`：resources.assets 路径，为空使用默认 Steam 安装路径。
+- `server`：监听地址与端口。
+- `polling`：轮询间隔，以及新 token 等待文件 mtime 稳定的秒数（避免 Steam 半写入时误触发）。
+- `github`：目标仓库、event_type 与 token（token 只填写在本地 config.yaml）。
+- `state`：已 dispatch 的 token 记录文件。
+- `dispatch`：发现新 token 时是否自动调用 repository_dispatch；为 true 而 token 为空时启动报错。
+- `verify`：提取到新 token 时是否在线校验，并在响应中加入 `hash` 字段。
+
+服务就绪后把 `src/config.yaml` 的 `sources.status_url` 改为 `http://<host>:<port>/api/status` 即可让工作流改用本服务。
 
 ## 本地验证
 

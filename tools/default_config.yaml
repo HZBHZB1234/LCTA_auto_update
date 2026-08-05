@@ -1,0 +1,41 @@
+# ============================================================
+# LCTA 自托管状态服务 — 默认配置模板
+# ============================================================
+# 部署时将本文件复制为同目录 config.yaml 再修改:
+#     copy tools\default_config.yaml tools\config.yaml
+# config.yaml 已加入 .gitignore,不会提交到仓库。
+
+# resources.assets 路径;为空字符串时使用默认 Steam 安装路径
+asset: ""
+
+# ---------- HTTP 服务 ----------
+server:
+  # 服务地址;
+  host: "0.0.0.0"
+  # 监听端口
+  port: 8080
+
+# ---------- 轮询 ----------
+polling:
+  # 检查 resources.assets 变化的时间间隔(秒)
+  interval: 3600
+  # 新 token 需等待文件 mtime 保持稳定的秒数,避免 Steam 半写入时误触发
+  stability: 30
+
+# ---------- GitHub dispatch ----------
+github:
+  # 触发自动更新的仓库,owner/repository 格式
+  repository: "HZBHZB1234/LCTA_auto_update"
+  # repository_dispatch 的 event_type
+  event_type: "voidfissure_update"
+  # GitHub token;只填写在本地 config.yaml 中,不要提交到仓库
+  token: ""
+
+# 已 dispatch 的 token 记录文件,防止重启后重复触发
+state: "~/.lcta_status_server.json"
+
+# 发现新 token 时是否自动调用 repository_dispatch
+dispatch: true
+
+# 提取到新 token 时是否在线校验,并在 /api/status 响应中加入 hash 字段
+verify: false
