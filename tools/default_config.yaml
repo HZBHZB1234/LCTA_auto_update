@@ -6,7 +6,8 @@
 # config.yaml 已加入 .gitignore,不会提交到仓库。
 
 # resources.assets 路径;为空字符串时按
-# steamcmd.install_dir → Steam 默认路径 的顺序解析
+# steam.install_dir → steamcmd.install_dir → Steam 默认路径 → steamcmd 目录
+# 的顺序解析
 asset: ""
 
 # ---------- HTTP 服务 ----------
@@ -23,7 +24,7 @@ polling:
 
 # ---------- 更新窗口 ----------
 # 游戏主要在每周四北京时间 11:00 更新,此处从 10:00 开始到 13:00 结束,
-# 每 15 分钟遍历一次(先 steamcmd 更新,再扫描 resources.assets)。
+# 每 15 分钟遍历一次(优先扫描 Steam 安装,缺失时回退 steamcmd 更新)。
 # 窗口外不运行,保留 POST /api/check 手动触发。
 schedule:
   # 总开关;关闭后始终按 interval 遍历
@@ -37,7 +38,16 @@ schedule:
   # 窗口内遍历间隔(秒)
   interval: 900
 
-# ---------- SteamCMD ----------
+# ---------- Steam 客户端(优先) ----------
+# 优先使用已登录 Steam 客户端安装的游戏: 游戏更新由 Steam 自动完成,
+# 服务只负责扫描其 resources.assets。请保持 Steam 客户端运行并开启
+# 开机自启,否则游戏不会自动更新。
+steam:
+  # Steam 安装目录;为空使用默认路径 C:\Program Files (x86)\Steam
+  install_dir: ""
+
+# ---------- SteamCMD(回退) ----------
+# 仅当 Steam 安装的 resources.assets 不存在时才执行 steamcmd。
 steamcmd:
   # steamcmd 可执行文件路径;为空则不执行 steamcmd
   path: ""
@@ -45,8 +55,10 @@ steamcmd:
   app_id: 1973530
   # 安装目录;为空使用 steamcmd 默认安装位置,否则使用 +force_install_dir
   install_dir: ""
-  # 登录方式;免费游戏可使用 anonymous
+  # 登录方式;Limbus Company 不支持匿名下载,需填写真实账号 "用户名 密码"
   login: "anonymous"
+  # 是否使用 -validate 全量校验文件(较慢,首次安装或怀疑损坏时开启)
+  validate: false
   # 单次执行超时(秒)
   timeout: 900
 

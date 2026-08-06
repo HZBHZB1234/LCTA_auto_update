@@ -11,4 +11,4 @@ run-summary.json
 translation-dump.jsonl
 update.md
 .pytest_cache/
-*/*.exe
+tools/steamCmd

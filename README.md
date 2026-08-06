@@ -66,19 +66,27 @@ dispatch payload 中不需要携带 raw token。脚本始终重新请求 status 
 # 1. 复制默认配置并填写 github.token（config.yaml 已加入 .gitignore，不会提交）
 copy tools\default_config.yaml tools\config.yaml
 
-# 2. 启动（默认读取 tools\config.yaml；可用环境变量 LCTA_STATUS_CONFIG 指定其他路径）
-python tools\status_server.py
+# 2. 安装依赖（Flask 作为 HTTP 服务器）
+python -m pip install -r requirements.txt
+
+# 3. 启动（默认读取 tools\config.yaml；可用环境变量 LCTA_STATUS_CONFIG 指定其他路径）
+python -m tools.status_server
 ```
 
-服务会按 `schedule` 配置的更新窗口运行（默认每周四北京时间 10:00–13:00，每 15 分钟遍历一次）：每次遍历先执行 steamcmd 更新游戏，再扫描 `resources.assets`（路径在 `asset` 配置项，为空则按 `steamcmd.install_dir` → 默认 Steam 路径解析）提取最新 CDN token，并通过 `GET /api/status` 提供与 voidfissure 相同格式的响应；发现新 token 且文件稳定后自动调用 `repository_dispatch` 触发工作流，已触发过的 token 记录在 `state` 文件，重启不会重复触发。窗口外不运行，但可通过 `POST /api/check` 手动触发一次完整遍历（steamcmd + 扫描 + dispatch），返回 202。
+服务会按 `schedule` 配置的更新窗口运行（默认每周四北京时间 10:00–13:00，每 15 分钟遍历一次）：每次遍历优先使用已登录 Steam 客户端安装的游戏——游戏更新由 Steam 自动完成，服务直接扫描其 `resources.assets`；若 Steam 安装不存在则回退执行 steamcmd 更新。随后提取最新 CDN token，并通过 `GET /api/status` 提供与 voidfissure 相同格式的响应；发现新 token 且文件稳定后自动调用 `repository_dispatch` 触发工作流，已触发过的 token 记录在 `state` 文件，重启不会重复触发。首次运行（状态文件无基线）时会把当前 token 记录为基线而不触发 dispatch，避免将已存在多时的 token 误报为新 token。窗口外不运行，但可通过 `POST /api/check` 手动触发一次完整遍历（更新 + 扫描 + dispatch），返回 202。
+
+更新源选择顺序：显式配置的 `asset` 优先（直接扫描，不执行 steamcmd）→ `steam` 安装（优先，需保持 Steam 客户端运行以自动更新游戏，建议开机自启并自动登录）→ `steamcmd`（回退，仅当 Steam 安装不存在时执行）。steamcmd 失败后会再次检查 Steam 安装是否已出现，有则回退扫描。
+
+steamcmd 执行细节：命令为 `+login <login> +app_license_request <app_id> +app_update <app_id> [-validate] +quit`（`app_license_request` 为 F2P 游戏获取免费许可）；输出实时转发到主程序控制台；由于 steamcmd 在失败时仍可能返回退出码 0，脚本会解析输出中的 `Success! App '…' fully installed` / `App '…' already up to date` 标志判断是否真正成功。注意 Limbus Company 不支持匿名下载（`No subscription`），使用 steamcmd 时需在 `login` 填写真实账号（`用户名 密码`，首次登录需处理 Steam Guard 验证码）。使用 Steam 客户端优先路径时无需 steamcmd。
 
 主要配置项：
 
-- `asset`：resources.assets 路径，为空按 `steamcmd.install_dir` → 默认 Steam 安装路径解析。
+- `asset`：resources.assets 路径，为空按 `steam` → `steamcmd.install_dir` → 默认 Steam 安装路径 → steamcmd 目录解析。
 - `server`：监听地址与端口。
 - `polling`：新 token 等待 mtime 稳定的秒数（避免 steamcmd 半写入时误触发）。
 - `schedule`：更新窗口——`update_dow`（0=周一，默认 3=周四）、`start_hour`/`end_hour`（北京时间，默认 10–13）、`interval`（窗口内遍历间隔，默认 900 秒）；`enabled: false` 则始终按 `interval` 遍历。
-- `steamcmd`：`path`（可执行文件路径，为空则不执行）、`app_id`（默认 1973530）、`install_dir`（为空用 steamcmd 默认安装位置，否则 `+force_install_dir`）、`login`（默认 anonymous）、`timeout`。
+- `steam`：`install_dir`（Steam 安装目录，为空使用默认路径 `C:\Program Files (x86)\Steam`）。
+- `steamcmd`：`path`（可执行文件路径，为空则不执行）、`app_id`（默认 1973530）、`install_dir`（为空则安装到 steamcmd 自身目录，否则 `+force_install_dir`）、`login`（默认 anonymous，Limbus Company 需填真实账号）、`validate`（默认 false，开启后使用 `-validate` 全量校验，首次安装或怀疑损坏时使用）、`timeout`（默认 900 秒，首次全量下载约 10GB 时建议调大）。
 - `github`：目标仓库、event_type 与 token（token 只填写在本地 config.yaml）。
 - `state`：已 dispatch 的 token 记录文件。
 - `dispatch`：发现新 token 时是否自动调用 repository_dispatch；为 true 而 token 为空时启动报错。
