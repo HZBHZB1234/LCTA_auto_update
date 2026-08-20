@@ -12,3 +12,4 @@ translation-dump.jsonl
 update.md
 .pytest_cache/
 tools/steamCmd
+lcta-diagnostics-*
