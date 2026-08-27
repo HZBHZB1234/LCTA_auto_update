@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 from pathlib import Path
@@ -28,21 +28,45 @@ class RawStatus:
 
 
 @dataclass(frozen=True)
+class GitHubAsset:
+    name: str
+    browser_download_url: str
+    content_type: str
+    size: int
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> "GitHubAsset":
+        return cls(
+            name=str(data.get("name", "")),
+            browser_download_url=str(data.get("browser_download_url") or ""),
+            content_type=str(data.get("content_type") or ""),
+            size=int(data.get("size") or 0),
+        )
+
+
+@dataclass(frozen=True)
 class GitHubRelease:
     tag_name: str
     body: str
     published_at: str
     zipball_url: str
-    draft: bool
-    prerelease: bool
+    assets: list[GitHubAsset] = field(default_factory=list)
+    draft: bool = False
+    prerelease: bool = False
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> "GitHubRelease":
+        assets = [
+            GitHubAsset.from_api(item)
+            for item in data.get("assets", [])
+            if isinstance(item, dict)
+        ]
         return cls(
             tag_name=str(data.get("tag_name", "")),
             body=str(data.get("body") or ""),
             published_at=str(data.get("published_at") or ""),
             zipball_url=str(data.get("zipball_url") or ""),
+            assets=assets,
             draft=bool(data.get("draft", False)),
             prerelease=bool(data.get("prerelease", False)),
         )
@@ -142,8 +166,6 @@ class GitHubClient:
         release = GitHubRelease.from_api(data)
         if release.draft or release.prerelease or not release.tag_name:
             raise RuntimeError(f"没有可用的正式 Release: {repository}")
-        if not release.zipball_url:
-            raise RuntimeError(f"Release 缺少源码 ZIP 地址: {repository}")
         return release
 
     def list_releases(self, repository: str, limit: int = 100) -> list[GitHubRelease]:
@@ -155,11 +177,41 @@ class GitHubClient:
             raise RuntimeError(f"GitHub Release 列表响应无效: {repository}")
         return [GitHubRelease.from_api(item) for item in data if isinstance(item, dict)]
 
-    def download_release_source(
-        self, release: GitHubRelease, destination: Path
+    def find_cooked_asset(
+        self, release: GitHubRelease, prefix: str, fmt: str
+    ) -> GitHubAsset:
+        """在 Release 资产中定位 cooked LLC 归档。
+
+        匹配规则：资产名以 ``fmt`` 为后缀，且（当 ``prefix`` 非空时）以
+        ``prefix`` 开头。需唯一命中，否则抛出带可用资产清单的清晰错误。
+        """
+        fmt = (fmt or "").lower()
+        if not fmt:
+            raise RuntimeError("cooked_asset_format 不能为空")
+        candidates = [
+            asset
+            for asset in release.assets
+            if asset.name.lower().endswith(f".{fmt}")
+            and (not prefix or asset.name.startswith(prefix))
+        ]
+        if not candidates:
+            available = ", ".join(a.name for a in release.assets) or "(无资产)"
+            raise RuntimeError(
+                f"在 Release {release.tag_name} 中未找到匹配的 cooked 资产"
+                f"(prefix={prefix!r}, format={fmt!r})；可用资产: {available}"
+            )
+        if len(candidates) > 1:
+            names = ", ".join(a.name for a in candidates)
+            raise RuntimeError(
+                f"匹配到多个 cooked 资产，无法唯一确定: {names}"
+            )
+        return candidates[0]
+
+    def download_release_asset(
+        self, asset: GitHubAsset, destination: Path
     ) -> None:
         self._client.download(
-            release.zipball_url, destination, headers=self._headers
+            asset.browser_download_url, destination, headers=self._headers
         )
 
 

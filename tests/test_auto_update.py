@@ -7,8 +7,15 @@ import zipfile
 
 import pytest
 
-from auto_update.archive import extract_zip_safely, find_named_directory
+from auto_update.archive import (
+    extract_archive_safely,
+    extract_zip_safely,
+    find_named_directory,
+    find_repository_root,
+)
 from auto_update.clients import (
+    GitHubAsset,
+    GitHubClient,
     GitHubRelease,
     build_release_metadata,
     fetch_raw_status,
@@ -97,6 +104,120 @@ class FakeHttpClient:
 
     def get_json(self, _url):
         return self.data
+
+
+class FakeGitHubClient(GitHubClient):
+    def __init__(self):
+        super().__init__(FakeHttpClient({}))
+
+
+def _asset(name, url="https://example.invalid/a"):
+    return GitHubAsset(
+        name=name, browser_download_url=url, content_type="", size=0
+    )
+
+
+def test_find_cooked_asset_selects_zip_by_suffix():
+    release = GitHubRelease(
+        tag_name="2026082101",
+        body="",
+        published_at="2026-08-21T00:00:00Z",
+        zipball_url="",
+        assets=[
+            _asset("LimbusLocalize_2026082101.7z"),
+            _asset("LimbusLocalize_2026082101.zip"),
+        ],
+        draft=False,
+        prerelease=False,
+    )
+    client = FakeGitHubClient()
+    asset = client.find_cooked_asset(release, "", "zip")
+    assert asset.name == "LimbusLocalize_2026082101.zip"
+
+
+def test_find_cooked_asset_respects_prefix():
+    release = GitHubRelease(
+        tag_name="2026082101",
+        body="",
+        published_at="2026-08-21T00:00:00Z",
+        zipball_url="",
+        assets=[
+            _asset("LimbusLocalize_2026082101.zip"),
+            _asset("other_2026082101.zip"),
+        ],
+        draft=False,
+        prerelease=False,
+    )
+    client = FakeGitHubClient()
+    asset = client.find_cooked_asset(release, "LimbusLocalize_", "zip")
+    assert asset.name == "LimbusLocalize_2026082101.zip"
+
+
+def test_find_cooked_asset_errors_when_missing():
+    release = GitHubRelease(
+        tag_name="2026082101",
+        body="",
+        published_at="2026-08-21T00:00:00Z",
+        zipball_url="",
+        assets=[_asset("notes.txt")],
+        draft=False,
+        prerelease=False,
+    )
+    client = FakeGitHubClient()
+    with pytest.raises(RuntimeError, match="未找到匹配"):
+        client.find_cooked_asset(release, "", "zip")
+
+
+def test_find_cooked_asset_errors_when_ambiguous():
+    release = GitHubRelease(
+        tag_name="2026082101",
+        body="",
+        published_at="2026-08-21T00:00:00Z",
+        zipball_url="",
+        assets=[
+            _asset("a.zip"),
+            _asset("b.zip"),
+        ],
+        draft=False,
+        prerelease=False,
+    )
+    client = FakeGitHubClient()
+    with pytest.raises(RuntimeError, match="多个"):
+        client.find_cooked_asset(release, "", "zip")
+
+
+def test_extract_archive_safely_locates_nested_llc(tmp_path):
+    archive_path = tmp_path / "cooked.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "LimbusCompany_Data/Lang/LLC_zh-CN/Passives.json", "{}"
+        )
+    extracted = tmp_path / "cooked"
+    extract_archive_safely(archive_path, extracted)
+    cooked_root = find_repository_root(extracted, "LLC_zh-CN")
+    assert (cooked_root / "LLC_zh-CN" / "Passives.json").is_file()
+
+
+def test_extract_archive_rejects_unsafe_7z_missing_tool(tmp_path):
+    # 没有 7z 工具时，.7z 应给出清晰错误而非静默失败
+    archive_path = tmp_path / "cooked.7z"
+    archive_path.write_bytes(b"not-a-real-7z")
+    with pytest.raises(RuntimeError, match="7z"):
+        extract_archive_safely(archive_path, tmp_path / "out")
+
+
+def test_extract_archive_rejects_unknown_format(tmp_path):
+    archive_path = tmp_path / "cooked.tar"
+    archive_path.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="不支持的归档格式"):
+        extract_archive_safely(archive_path, tmp_path / "out")
+
+
+def test_config_parses_cooked_asset_fields():
+    config_path = Path(__file__).resolve().parents[1] / "src" / "config.yaml"
+    config = AppConfig.load(config_path)
+    assert config.sources.cooked_asset_format == "zip"
+    assert config.sources.cooked_asset_prefix == ""
 
 
 def test_status_token_validation():

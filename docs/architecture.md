@@ -9,7 +9,7 @@
 
 ## 数据流
 
-`repository_dispatch` → status API → 官方 JP/KR/EN ZIP → 最新熟肉 Release 源码快照 → `TranslationPipeline` → `LLc-CN-LCTA` → ZIP/7Z → GitHub Release。
+`repository_dispatch` → status API → 官方 JP/KR/EN ZIP → 最新熟肉 Release 资产（cooked LLC ZIP）→ `TranslationPipeline` → `LLc-CN-LCTA` → ZIP/7Z → GitHub Release。
 
 ## 失败策略
 

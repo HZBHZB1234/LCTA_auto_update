@@ -17,6 +17,8 @@ class SourcesConfig:
     raw_url_template: str
     raw_languages: tuple[str, ...]
     cooked_repository: str
+    cooked_asset_prefix: str
+    cooked_asset_format: str
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,11 @@ class AppConfig:
         if cooked_repository.count("/") != 1:
             raise ConfigError("sources.cooked_repository 必须使用 owner/repository 格式")
 
+        cooked_asset_prefix = _optional_string(sources, "cooked_asset_prefix")
+        cooked_asset_format = _choice(
+            sources, "cooked_asset_format", {"zip", "7z"}
+        )
+
         connect_timeout = _positive_number(network, "connect_timeout")
         read_timeout = _positive_number(network, "read_timeout")
         retries = _integer(network, "retries", minimum=0, maximum=10)
@@ -142,6 +149,8 @@ class AppConfig:
                 raw_url_template=raw_url_template,
                 raw_languages=tuple(languages),
                 cooked_repository=cooked_repository,
+                cooked_asset_prefix=cooked_asset_prefix,
+                cooked_asset_format=cooked_asset_format,
             ),
             network=NetworkConfig(
                 connect_timeout=connect_timeout,

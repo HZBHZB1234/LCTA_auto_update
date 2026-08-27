@@ -21,6 +21,12 @@ sources:
   # 已翻译文本的 GitHub 仓库
   cooked_repository: "LocalizeLimbusCompany/LocalizeLimbusCompany"
 
+  # cooked LLC 改为从该仓库 Release 的「上传资产」获取，而非拉取源码 zipball。
+  # 匹配规则：资产名需以 cooked_asset_format 为后缀，且（可选）以 cooked_asset_prefix 开头。
+  # 例：Release 资产 LimbusLocalize_2026082101.zip 命中 prefix="" + format="zip"。
+  cooked_asset_prefix: ""
+  cooked_asset_format: "zip"
+
 # ---------- 网络连接配置 ----------
 network:
   # 建立 TCP 连接的超时时间（秒）

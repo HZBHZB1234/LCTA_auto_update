@@ -10,6 +10,7 @@ import tempfile
 from typing import Any
 
 from auto_update.archive import (
+    extract_archive_safely,
     extract_zip_safely,
     find_named_directory,
     find_repository_root,
@@ -122,7 +123,11 @@ def run(project_root: Path, config: AppConfig) -> None:
             http, config, raw_status, temporary_root
         )
         cooked_root = _download_cooked_source(
-            github, cooked_release, temporary_root
+            github,
+            cooked_release,
+            temporary_root,
+            asset_prefix=config.sources.cooked_asset_prefix,
+            asset_format=config.sources.cooked_asset_format,
         )
         summary, staged_output = _run_translation(
             config,
@@ -210,11 +215,15 @@ def _download_cooked_source(
     github: GitHubClient,
     release: GitHubRelease,
     temporary_root: Path,
+    *,
+    asset_prefix: str,
+    asset_format: str,
 ) -> Path:
-    archive_path = temporary_root / "downloads" / "cooked.zip"
-    github.download_release_source(release, archive_path)
+    asset = github.find_cooked_asset(release, asset_prefix, asset_format)
+    archive_path = temporary_root / "downloads" / f"cooked.{asset_format}"
+    github.download_release_asset(asset, archive_path)
     extracted = temporary_root / "cooked"
-    extract_zip_safely(archive_path, extracted)
+    extract_archive_safely(archive_path, extracted)
     return find_repository_root(extracted, "LLC_zh-CN")
 
 
@@ -310,7 +319,13 @@ def _write_package_info(
         json.dumps(version_info, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    # cooked 资产内部布局可能嵌套（如 LimbusCompany_Data/Lang/LLC_zh-CN），
+    # LICENSE 不一定位于 cooked_root 顶层，故做一次递归查找以尽力还原旧行为。
     license_source = cooked_root / "LICENSE"
+    if not license_source.is_file():
+        matches = [p for p in cooked_root.rglob("LICENSE") if p.is_file()]
+        if matches:
+            license_source = matches[0]
     if license_source.is_file():
         shutil.copy2(license_source, info_directory / "LICENSE")
 
