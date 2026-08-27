@@ -2,3 +2,4 @@ translatekit
 requests>=2.32,<3
 pyyaml>=6,<7
 flask>=3,<4
+json_repair>=0.30,<1
