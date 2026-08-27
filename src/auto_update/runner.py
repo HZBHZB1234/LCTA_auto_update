@@ -113,6 +113,8 @@ def run(project_root: Path, config: AppConfig) -> None:
     assets_directory = project_root / "release-assets"
     _remove_generated_path(project_root, output_directory)
     _remove_generated_path(project_root, assets_directory)
+    # 诊断包可能持久化的源文件目录（cooked LLC / 游戏原文），先清理残留
+    _remove_generated_path(project_root, project_root / "diagnostics")
 
     with tempfile.TemporaryDirectory(prefix="lcta-auto-update-") as temp_name:
         temporary_root = Path(temp_name)
@@ -131,6 +133,13 @@ def run(project_root: Path, config: AppConfig) -> None:
         dump_file = temporary_root / "translation-dump.jsonl"
         if dump_file.is_file():
             shutil.copy2(dump_file, project_root / dump_file.name)
+        if config.publishing.upload_diagnostics:
+            # 将 cooked LLC 与游戏原文持久化到 project_root，随诊断包一起上传
+            _stage_diagnostic_sources(
+                project_root,
+                raw_paths=raw_paths,
+                cooked_root=cooked_root,
+            )
         if not any(staged_output.rglob("*.json")):
             raise RuntimeError("翻译管线没有生成任何 JSON 文件")
         _write_package_info(
@@ -261,6 +270,33 @@ def _run_translation(
     pipeline.set_callbacks(on_log=_logger.info)
     summary = pipeline.run()
     return summary, pipeline_output_root / "LLc-CN-LCTA"
+
+
+def _stage_diagnostic_sources(
+    project_root: Path,
+    *,
+    raw_paths: dict[str, Path],
+    cooked_root: Path,
+) -> None:
+    """将 cooked LLC 与游戏原文复制到 project_root，供诊断包上传使用。
+
+    cooked LLC 来自熟肉仓库的 ``LLC_zh-CN`` 目录；游戏原文来自各语言生肉
+    下载目录（``raw_paths``）。两者默认只存在于临时目录，流程结束后会被
+    自动清理，因此需要在上传诊断包之前把它们持久化到 ``project_root``。
+    """
+    diagnostics_root = project_root / "diagnostics"
+    _remove_generated_path(project_root, diagnostics_root)
+    diagnostics_root.mkdir(parents=True, exist_ok=True)
+
+    # cooked LLC（已翻译的中文参考文件）
+    cooked_llc = cooked_root / "LLC_zh-CN"
+    if cooked_llc.is_dir():
+        shutil.copytree(cooked_llc, diagnostics_root / "cooked-LLC_zh-CN")
+
+    # 游戏原文（各语言生肉）
+    for language, source_path in raw_paths.items():
+        if source_path.is_dir():
+            shutil.copytree(source_path, diagnostics_root / f"raw-{language}")
 
 
 def _write_package_info(

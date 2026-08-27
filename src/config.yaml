@@ -129,5 +129,5 @@ publishing:
   # 发布包的文件名前缀
   asset_prefix: "LLc-CN-LCTA"
 
-  # 上传诊断信息到 GitHub Release body
+  # 上传诊断包（run-summary.json、translation-dump、cooked LLC 与游戏原文等）作为 GitHub Action 产物
   upload_diagnostics: true

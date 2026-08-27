@@ -70,5 +70,6 @@ jobs:
             run-summary.json
             translation-dump.jsonl
             release-assets/
+            diagnostics/
           if-no-files-found: warn
           retention-days: 7
