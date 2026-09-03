@@ -33,7 +33,7 @@ jobs:
 
       - name: Install 7-Zip
         run: |
-          if python -c "import json,sys; sys.exit(0 if json.load(open('src/config.json', encoding='utf-8'))['publishing']['seven_zip'] else 1)"; then
+          if python -c "import sys,yaml; sys.exit(0 if yaml.safe_load(open('src/config.yaml', encoding='utf-8'))['publishing']['seven_zip'] else 1)"; then
             sudo apt-get update
             sudo apt-get install -y p7zip-full
           else
