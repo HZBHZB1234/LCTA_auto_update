@@ -149,6 +149,10 @@ class FileProcessor:
             # 6. 获取待翻译列表
             self._get_translating()
             if not self.translating_list:
+                # KR 每条均已被 LLC 覆盖，视为已翻译；若此处 LLC 文件存在则落盘，
+                # 避免出现"判为已翻译却未生成产出文件"的静默丢失。
+                if self.path_config.LLC_path.exists():
+                    self._save_llc()
                 outcome = ProcessOutcome(ProcessResult.ALREADY_TRANSLATED, self.file_name)
                 self._write_processing_log(outcome, start_time)
                 return outcome
@@ -1432,8 +1436,12 @@ class FileProcessor:
             if self.llc_index:
                 self.llc_index = _align(self.llc_index, self.kr_index)
 
-        # 验证 LLC 源文件确实存在，且索引键匹配
-        if self.llc_index and list(self.kr_index.keys()) == list(self.llc_index.keys()):
+        # 验证 LLC 源文件确实存在，且 KR 的 key 集合已被 LLC 全覆盖。
+        # 不能用 list() 全序比较：当 LLC 残留游戏已下架的 key（本文件多于 KR）、
+        # 或生肉重排 dataList 顺序时，全序不相等会让本应"已翻译"的文件落入
+        # _get_translating 的空集分支，被标成 ALREADY_TRANSLATED 却不落盘，
+        # 从而静默丢失 MainUIText.json 等 UI 主文件。改用集合包含判断即可。
+        if self.llc_index and set(self.kr_index).issubset(set(self.llc_index)):
             if self.path_config.LLC_path.exists():
                 self._save_llc()
                 return ProcessOutcome(ProcessResult.ALREADY_TRANSLATED, self.file_name)
