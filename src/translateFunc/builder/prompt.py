@@ -65,7 +65,7 @@ class PromptFactory:
     _STAGE1_RULES_DATA: list[dict] = [
         {"priority": "P0", "text": "翻译优先级：以韩文(KR)为源语言；日文(JP)和英文(EN)仅作为理解辅助参考。当KR与JP/EN语义不一致时，以KR为准"},
         {"priority": "P0", "text": "术语一致性：先查看reference中的术语表及每条文本块的proper_refs/affect_refs/model引用，确保术语一致；术语内容可能存在错误引用，如果术语内容与原文意思偏差过大，忽略该术语"},
-        {"priority": "P1", "text": "标点符号：中文翻译必须使用全角标点（！？，。：）、中文引号（“”），禁止使用半角标点(!?,. )"},
+        {"priority": "P1", "text": "标点符号：中文翻译必须使用全角标点（！？，。：）、中文引号（“”），禁止使用半角标点(!?,. )；禁止使用日式直角引号「」（原文自带除外）"},
         {"priority": "P1", "text": "参数保护：原文中的尖括号参数（如<0>、<1>）是游戏代码占位符，不得破坏其格式；理解参数含义后按中文语序放置到语法正确的位置"},
         {"priority": "P2", "text": "省略号：剧情文本使用六点省略号……；技能/UI紧凑文本使用三点省略号…。原文为长省略号时对齐长度"},
         {"priority": "P2", "text": "波浪号：使用半角波浪号~，不得从原文复制全角波浪号～（游戏字库缺字会导致显示异常）"},
@@ -112,9 +112,10 @@ class PromptFactory:
             {"priority": "P1", "text": "角色语气一致性：保持角色性格对应的语言风格"},
         ],
         "SKILL": [
-            {"priority": "P0", "text": "方括号[]内的内容为游戏引擎代码标识符（如[Bleed]、[Combustion]、[OnSucceedAttack]），必须原样保留英文，严禁将内部翻译成中文或韩文。正确的中文显示名应写为'名 '（无括号且尾随半角空格）。禁止生成[中文名]形式（如[出血]、[震颤]）"},
+            {"priority": "P0", "text": "方括号[]内的内容为游戏引擎代码标识符（如[OnSucceedAttack]、[BeforeAttack]、[SuperCoin]），必须原样保留英文，严禁将内部翻译成中文或韩文，禁止生成[中文名]形式（如[出血]、[震颤]）；正文中的状态效果应使用术语表中的中文名称（如'烧伤 强度'、'充能 层数'，名称后带半角空格），不得在正文中保留状态效果的英文ID"},
             {"priority": "P1", "text": "Buff名称空格：所有Buff/状态效果的中文名称翻译后应跟一个半角空格（如'震颤 '），即使位于句尾或标点前也不可省略此空格。示例：'施加2层震颤 。'正确，'施加2层震颤。'错误。除非位于[]中"},
-            {"priority": "P1", "text": "위력↔强度、횟수↔层数"},
+            {"priority": "P1", "text": "技能/硬币위력→威力：'코인 위력'译为'硬币威力'，'스킬 위력'译为'本技能威力'，不得译作'强度'"},
+            {"priority": "P1", "text": "状态效果위력→强度、횟수→层数：写作'Buff名 强度'/'Buff名 层数'（如'烧伤 强度'、'充能 层数'，名称后带半角空格）"},
             {"priority": "P1", "text": "技能描述紧凑：技能效果描述需精炼，Buff/Debuff名称遵循术语表约定"},
         ],
         "UI": [
@@ -686,11 +687,15 @@ class PromptFactory:
             expected_key = expected_keys.get(stage)
             result = data.get(expected_key, []) if expected_key else []
             if expected_key and not result:
-                self._last_parse_errors.append({
-                    "type": "MissingOrEmptyField",
-                    "message": f"响应缺少或清空了字段 {expected_key}",
-                    "available_keys": list(data.keys()) if isinstance(data, dict) else [],
-                })
+                if stage == 0:
+                    # 阶段 0 空消歧列表是合法结果：表示所有候选术语均适用，无需剔除
+                    _logger.debug("parse_response 阶段 0 返回空 disambiguations，视为无需消歧")
+                else:
+                    self._last_parse_errors.append({
+                        "type": "MissingOrEmptyField",
+                        "message": f"响应缺少或清空了字段 {expected_key}",
+                        "available_keys": list(data.keys()) if isinstance(data, dict) else [],
+                    })
             return result
         elif prompt_format == "xml_xml":
             results = self._try_parse_xml(text, stage)
