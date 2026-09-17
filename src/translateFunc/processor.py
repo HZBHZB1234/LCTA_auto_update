@@ -7,6 +7,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import logging
+import re
 import shutil
 import sys
 import threading
@@ -35,8 +36,30 @@ EMPTY_DATA = [{"dataList": []}, {}, []]
 EMPTY_DATA_LIST = [[], [{}]]
 SUCCESS_CALL_STATUSES = {"success", "recovered"}
 
+# 韩文（Hangul）码位：谚文音节 + 字母 + 兼容字母。
+# 用于识别「模型把待翻译的韩文原文原样回填」这种最典型的漏翻。
+_RE_HANGUL = re.compile(r"[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]")
+
 # 保护 processing_log.jsonl 的并发写入
 _processing_log_lock = threading.Lock()
+
+
+def contains_hangul(text) -> bool:
+    """文本中是否含韩文（Hangul）字符。"""
+    return bool(isinstance(text, str) and _RE_HANGUL.search(text))
+
+
+def is_untranslated_hangul(translation, source) -> bool:
+    """译文是否为「源文本含韩文、译文仍含韩文」的未翻译结果。
+
+    只有源(KR)含韩文时才判定：KR 为纯符号/数字/英文 ID（如 ``BGM_01``、``50%``）
+    时译文与原文相同属于正常，不构成漏翻。
+    """
+    if not contains_hangul(source):
+        return False
+    if not isinstance(translation, str):
+        return True
+    return contains_hangul(translation)
 
 
 class FileProcessor:
@@ -82,6 +105,8 @@ class FileProcessor:
         self.is_story: bool = False
         self.is_skill: bool = False
         self.translating_list: list = []
+        # {条目键: [待翻译字段路径]}，与 translating_list 同步由 _get_translating 填充
+        self.translating_fields: dict = {}
         self._base_index: dict = {}
 
     @property
@@ -223,6 +248,8 @@ class FileProcessor:
                         "schema_version": 2,
                         "timestamp": datetime.now().isoformat(),
                         "file_name": self.file_name,
+                        # file_name 只是 basename，排查漏翻时无法定位；补相对路径
+                        "relative_path": self._relative_path(),
                         "text_blocks": self._input_text_blocks,
                         "reference": self._input_reference,
                         "api_calls": self._api_calls,
@@ -242,6 +269,13 @@ class FileProcessor:
                     _logger.exception(
                         f"[{self.file_name}] 翻译 dump 写入失败: {self._recorder.file_path}"
                     )
+
+    def _relative_path(self) -> str:
+        """KR 文件相对生肉根目录的路径（统一为正斜杠），用于 dump 定位。"""
+        try:
+            return str(self.path_config.rel_path).replace("\\", "/")
+        except Exception:
+            return ""
 
     def _write_processing_log(self, outcome: ProcessOutcome, start_time: float) -> None:
         """将单文件处理结果追加写入 JSONL 日志文件。"""
@@ -676,11 +710,11 @@ class FileProcessor:
                         )
                         raise
 
-                    # 仅在 xml_json ↔ xml_xml 回退时清除缓存
-                    # （两者共用 _make_xml_user_prompt 产生相同 user_text，
-                    #  缓存键仅含 user_text hash，不区分 system_prompt/response_format）
-                    # 其他格式回退（json_json）user_text 不同，无需清缓存
-                    if fmt_idx > 0 and {formats_chain[fmt_idx - 1], fmt} == {"xml_json", "xml_xml"}:
+                    # 每次格式回退前清缓存：缓存键只含 user_text hash，不区分
+                    # system_prompt / response_format，跨格式复用可能拿到别格式的
+                    # 结果。此前只覆盖 xml_json ↔ xml_xml（两者 user_text 相同），
+                    # json_json 回退同样存在串味风险，故统一在回退时清空。
+                    if fmt_idx > 0:
                         self._translator.clear_cache()
 
                     try:
@@ -835,17 +869,66 @@ class FileProcessor:
                 else:
                     # P1-2: 部分格式成功但存在缺失条目 → 补充翻译重试
                     text_blocks = part_data.get("text_blocks", [])
-                    unresolved_count = len(retry_indices)
+                    # 韩文回填检测：源(KR)含韩文而译文仍含韩文 = 漏翻，纳入重试
+                    hangul_indices = [
+                        idx
+                        for idx, block in enumerate(text_blocks)
+                        if is_untranslated_hangul(
+                            part_result[idx] if idx < len(part_result) else "",
+                            block.get("kr", ""),
+                        )
+                    ]
+                    retry_targets = sorted(set(retry_indices) | set(hangul_indices))
+                    unresolved_count = len(retry_targets)
                     supplemental_call = None
-                    if retry_indices and len(retry_indices) < len(text_blocks):
+                    if retry_targets and len(retry_targets) < len(text_blocks):
                         fixed = self._retry_missing_entries(
                             builder, stage_strategy, part_data, part_result,
-                            retry_indices, tried_formats, i,
+                            retry_targets, tried_formats, i,
                         )
                         supplemental_call = self._api_calls[-1] if self._api_calls else None
                         unresolved_count -= fixed
 
-                    if unresolved_count > 0:
+                    remaining_hangul = [
+                        idx
+                        for idx in hangul_indices
+                        if idx < len(part_result)
+                        and is_untranslated_hangul(
+                            part_result[idx], text_blocks[idx].get("kr", "")
+                        )
+                    ]
+                    if remaining_hangul:
+                        self._record_diagnostic_event(
+                            stage="hangul_check",
+                            status="fallback",
+                            failure_kind="untranslated_hangul",
+                            prompt_format=user_format,
+                            part=i + 1,
+                            validation_errors=[{
+                                "count": len(remaining_hangul),
+                                "ids": [idx + 1 for idx in remaining_hangul[:10]],
+                                "action": "keep_model_output",
+                            }],
+                            metadata={
+                                "hangul_detected": len(hangul_indices),
+                                "fixed_by_retry": len(hangul_indices) - len(remaining_hangul),
+                                "samples": [
+                                    {
+                                        "id": idx + 1,
+                                        "source": str(text_blocks[idx].get("kr", ""))[:120],
+                                        "translation": str(part_result[idx])[:120],
+                                    }
+                                    for idx in remaining_hangul[:5]
+                                ],
+                            },
+                        )
+                        _logger.warning(
+                            f"[{self.file_name}] {len(remaining_hangul)} 条译文仍含韩文"
+                            f"（id: {[idx + 1 for idx in remaining_hangul[:10]]}...），"
+                            f"补充翻译未能修正，已标记为 fallback 并写入 dump"
+                        )
+
+                    if unresolved_count > 0 or remaining_hangul:
                         had_fallback = True
                     else:
                         self._mark_call_recovered(
@@ -1181,6 +1264,10 @@ class FileProcessor:
                 if st is not None and isinstance(st, dict):
                     trans = st.get("translation", "") or ""
                     confidence = str(st.get("confidence", "medium")).lower()
+                    source = missing_blocks[local_idx].get("kr", "") if local_idx < len(missing_blocks) else ""
+                    # 韩文原样回填不算修复，否则会把漏翻当成成功结果写进产出
+                    if is_untranslated_hangul(trans, source):
+                        continue
                     if trans and confidence_order.get(confidence, 1) >= confidence_threshold:
                         part_result[src_idx] = trans
                         fixed += 1
@@ -1426,26 +1513,31 @@ class FileProcessor:
         return None
 
     def _check_translated(self) -> ProcessOutcome | None:
-        """检查是否已翻译。已翻译时返回 ProcessOutcome。"""
-        if not len(self.jp_index) == len(self.kr_index) == len(self.en_index):
-            def _align(d: dict, ref: dict) -> dict:
-                return {k: d.get(k, ref[k]) for k in ref}
-            self.en_index = _align(self.en_index, self.kr_index)
-            self.jp_index = _align(self.jp_index, self.kr_index)
-            # 仅当 llc_index 非空时才对齐；空 LLC 意味着没有已翻译数据，不应生成虚假键
-            if self.llc_index:
-                self.llc_index = _align(self.llc_index, self.kr_index)
+        """检查整文件是否已被 LLC 完全覆盖。已完全覆盖时返回 ProcessOutcome。
 
-        # 验证 LLC 源文件确实存在，且 KR 的 key 集合已被 LLC 全覆盖。
-        # 不能用 list() 全序比较：当 LLC 残留游戏已下架的 key（本文件多于 KR）、
-        # 或生肉重排 dataList 顺序时，全序不相等会让本应"已翻译"的文件落入
-        # _get_translating 的空集分支，被标成 ALREADY_TRANSLATED 却不落盘，
-        # 从而静默丢失 MainUIText.json 等 UI 主文件。改用集合包含判断即可。
-        if self.llc_index and set(self.kr_index).issubset(set(self.llc_index)):
-            if self.path_config.LLC_path.exists():
-                self._save_llc()
-                return ProcessOutcome(ProcessResult.ALREADY_TRANSLATED, self.file_name)
-        return None
+        判定分两层，缺一不可：
+          1. 条目级：KR 的每个条目键都在 LLC 中；
+          2. 字段级：每个条目内部，KR 的每个文本字段都能在 LLC 同路径上取到值
+             （见 ``_get_translating``）。只满足第 1 层就整文件拷贝旧熟肉，
+             会让「旧 id 里新增的技能等级/新 coin 描述」等改动**直接从产出里消失**。
+
+        注意：这里**绝不能**对 ``llc_index`` 做 ``_align``。历史上曾在
+        jp/kr/en 长度不一致时用 KR 原文补齐 LLC 的缺失键，导致下面
+        ``set(kr).issubset(set(llc))`` 恒为真，整文件被误判为已翻译，
+        该文件本次的全部新条目被静默丢弃。jp/en 的参考缺失由
+        ``_get_translating_text`` 自行兜底，不需要在这里对齐。
+        """
+        if not self.llc_index or not self.path_config.LLC_path.exists():
+            return None
+        if not set(self.kr_index).issubset(set(self.llc_index)):
+            return None
+
+        self._get_translating()
+        if self.translating_list:
+            return None
+
+        self._save_llc()
+        return ProcessOutcome(ProcessResult.ALREADY_TRANSLATED, self.file_name)
 
     # ========== 初始化 ==========
 
@@ -1475,38 +1567,123 @@ class FileProcessor:
             self.jp_index = _make_non_story_index(self.jp_data)
             self.llc_index = _make_non_story_index(self.llc_data)
 
+    @staticmethod
+    def _flatten_texts(entry) -> dict:
+        """把单个条目展开为 ``{字段路径: 文本}``，与请求构建口径完全一致。
+
+        剔除 ``AVOID_PATH``（usage/id/model）对应的路径。
+        """
+        flat = flatten_dict_enhanced(entry, ignore_types=[None, int, float])
+        for path in [p for p in flat if p and p[-1] in AVOID_PATH]:
+            del flat[path]
+        return flat
+
+    @staticmethod
+    def _field_covered(llc_value, kr_value) -> bool:
+        """LLC 在某个字段路径上是否已经提供了可用译文。
+
+        - LLC 该路径为空/空白：仅当 KR 也是空文本时才算覆盖（无需翻译）；
+        - LLC 该路径是韩文原文的原样回填（LLC == KR 且含韩文）：视为**未覆盖**，
+          下一轮会重新翻译，避免这种漏翻一劳永逸地留在熟肉里；
+        - 其余情况（有值且不是原样回填）视为已覆盖。
+        """
+        if isinstance(llc_value, str) and not llc_value.strip():
+            return isinstance(kr_value, str) and not kr_value.strip()
+        if (
+            isinstance(llc_value, str)
+            and isinstance(kr_value, str)
+            and llc_value.strip() == kr_value.strip()
+            and contains_hangul(kr_value)
+        ):
+            return False
+        return True
+
     def _get_translating(self) -> None:
-        self.translating_list = [i for i in self.kr_index if i not in self.llc_index]
+        """计算待翻译集合，粒度是 ``(条目键, 字段路径)`` 而不是整条目。
+
+        - 条目键不在 LLC：整条待翻译；
+        - 条目键已在 LLC：只挑出 LLC 缺失/为空、或仍是韩文原样回填的字段。
+
+        这样「旧 id 里新增的技能等级、新增的 coin 描述」等改动才会被送进请求，
+        而不是因为 id 已存在就被整条跳过。
+        """
+        self.translating_list = []
+        self.translating_fields = {}
+        for key in self.kr_index:
+            kr_flat = self._flatten_texts(self.kr_index[key])
+            if key not in self.llc_index:
+                pending = list(kr_flat)
+            else:
+                llc_flat = self._flatten_texts(self.llc_index[key])
+                pending = [
+                    path
+                    for path, kr_value in kr_flat.items()
+                    if path not in llc_flat
+                    or not self._field_covered(llc_flat[path], kr_value)
+                ]
+            if not pending:
+                continue
+            self.translating_fields[key] = pending
+            self.translating_list.append(key)
 
     # ========== 文本提取 / 重建 ==========
 
     def _get_translating_text(self, lang: str = "kr") -> dict:
         lang_index = {"kr": self.kr_index, "jp": self.jp_index, "en": self.en_index}[lang]
         translating_text = {}
-        for i in self.translating_list:
-            flat = flatten_dict_enhanced(lang_index[i], ignore_types=[None, int, float])
-            to_delete = [k for k in flat if k[-1] in AVOID_PATH]
-            for k in to_delete:
-                del flat[k]
-            translating_text[i] = flat
+        for key in self.translating_list:
+            entry = lang_index.get(key)
+            flat = self._flatten_texts(entry) if entry is not None else {}
+            pending = self.translating_fields.get(key)
+            if pending is not None:
+                allowed = set(pending)
+                flat = {path: value for path, value in flat.items() if path in allowed}
+            translating_text[key] = flat
         return translating_text
 
     def _de_get_translating_text(self, translated_text: dict) -> dict:
-        self._base_index = deepcopy(self.kr_index)
-        for i in self.translating_list:
-            trans_item = self._base_index[i]
-            translated_item = translated_text[i]
-            update_dict_with_flattened(trans_item, translated_item)
+        """组装产出：以 KR 结构为骨架，先回填 LLC 已翻译字段，再写入本次新译文。
+
+        不能像旧实现那样「已覆盖条目整条用 LLC 替换」——那会把 KR 该条目
+        内部的全部变化（新增字段、改写文本）一起丢掉。
+        """
+        base = deepcopy(self.kr_index)
+
+        # 1) 字段级回填 LLC 已翻译的字段（未覆盖的字段保持 KR 原文，由第 2 步填）
+        for key, entry in base.items():
+            if key not in self.llc_index:
+                continue
+            kr_flat = self._flatten_texts(entry)
+            llc_flat = self._flatten_texts(self.llc_index[key])
+            updates = {
+                path: llc_flat[path]
+                for path, kr_value in kr_flat.items()
+                if path in llc_flat and self._field_covered(llc_flat[path], kr_value)
+            }
+            if updates:
+                update_dict_with_flattened(entry, updates)
+
+        # 2) 写入本次新翻译；非空 KR 字段拿到空译文时回填 KR 原文，避免产出出现空洞
+        for key in self.translating_list:
+            if key not in base:
+                continue
+            kr_flat = self._flatten_texts(self.kr_index[key])
+            updates = dict(translated_text.get(key) or {})
+            for path, value in list(updates.items()):
+                if (
+                    isinstance(value, str)
+                    and not value.strip()
+                    and str(kr_flat.get(path, "")).strip()
+                ):
+                    updates[path] = kr_flat[path]
+            if updates:
+                update_dict_with_flattened(base[key], updates)
+
+        self._base_index = base
         return self._base_index
 
     def _de_get_translating(self) -> dict:
-        result = []
-        for i in self.kr_index:
-            if i in self.llc_index:
-                result.append(self.llc_index[i])
-            else:
-                result.append(self._base_index[i])
-        return {"dataList": result}
+        return {"dataList": [self._base_index[key] for key in self.kr_index]}
 
     # ========== 保存 ==========
 

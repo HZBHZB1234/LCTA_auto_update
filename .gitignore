@@ -13,3 +13,5 @@ update.md
 .pytest_cache/
 tools/steamCmd
 lcta-diagnostics-*
+benchmark
+.workbuddy
