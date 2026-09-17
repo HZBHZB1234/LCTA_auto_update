@@ -135,3 +135,40 @@ def test_skill_filetype_system_prompt_contains_examples() -> None:
     prompt = factory.build_system_prompt(file_type=FileType.SKILL, stage=1, prompt_format="xml_json")
     assert "烧伤 强度" in prompt
     assert "硬币威力" in prompt
+
+
+# ---------- 阶段 1 提示词：新专有名词回传与降级档位 ----------
+
+
+def test_stage1_prompt_requests_new_terms() -> None:
+    """模型翻译时要顺带回传 glossary 未收录的专有名词，供下次输入合并。"""
+    factory = PromptFactory()
+    prompt = factory.build_system_prompt(
+        file_type=FileType.SKILL, stage=1, prompt_format="xml_json",
+    )
+    assert "new_terms" in prompt
+    assert "glossary未收录" in prompt
+
+
+def test_minimal_verbosity_drops_optional_new_terms() -> None:
+    """降级到极简档时不再索取 new_terms，响应规则要压到最小。"""
+    factory = PromptFactory()
+    minimal = factory.build_system_prompt(
+        file_type=FileType.SKILL, stage=1, prompt_format="xml_json",
+        verbosity="minimal",
+    )
+    assert "new_terms" not in minimal
+    assert "[Bleed]" in minimal          # 硬保护规则仍在
+
+
+def test_full_verbosity_is_the_default_snapshot() -> None:
+    """full 是默认档，显式传 full 必须与默认输出完全一致。"""
+    factory = PromptFactory()
+    default = factory.build_system_prompt(
+        file_type=FileType.SKILL, stage=1, prompt_format="xml_json",
+    )
+    explicit = factory.build_system_prompt(
+        file_type=FileType.SKILL, stage=1, prompt_format="xml_json",
+        verbosity="full",
+    )
+    assert default == explicit

@@ -33,6 +33,12 @@ from translateFunc.matcher.proper import ProperAnalyzer
 from translateFunc.processor import FileProcessor
 from translateFunc.workers import WorkerPool
 from translateFunc.get_proper import fetch as fetch_proper
+from translateFunc.proper.new_terms import (
+    DEFAULT_FILE_NAME,
+    NewTermCollector,
+    load_learned,
+    merge_terms,
+)
 from translateFunc.translate_request import TRANSLATOR_TRANS
 # system_prompt 由 processor 通过 translator.update_config() 动态更新
 from translateFunc.profiler import TimingProfiler
@@ -52,6 +58,7 @@ class TranslationPipeline:
         self._engine = MatcherEngine()
         self._analyzer: ProperAnalyzer | None = None
         self._recorder: "TranslationRecorder | None" = None
+        self._new_term_collector: NewTermCollector | None = None
 
         if config.dump and config.dump_path:
             from translateFunc.recorder import TranslationRecorder
@@ -130,6 +137,9 @@ class TranslationPipeline:
                         proper_path=self._config.proper_path,
                     )
 
+                # 并入本地累积的新专有名词（远程表优先，本地只补空缺）
+                raw_terms = self._merge_learned_terms(raw_terms)
+
                 with profiler.phase("专有名词分析"):
                     proper_terms = self._analyzer.analyze(raw_terms)
                     proper_dicts = [
@@ -140,6 +150,16 @@ class TranslationPipeline:
                 self._log_bridge.info(f"已加载 {len(proper_terms)} 个专有名词")
             else:
                 self._log_bridge.info("专有名词分析已跳过（enable_proper=False）")
+
+        # 2.5 新专有名词收集器：模型回传 → 落盘 → 下次运行合并
+        if self._config.enable_new_terms:
+            self._new_term_collector = NewTermCollector(
+                self._new_terms_path(),
+                min_votes=self._config.new_terms_min_votes,
+            )
+            if self._engine.proper_terms:
+                # 已在术语表中的词不需要重复学习
+                self._new_term_collector.mark_known(self._engine.proper_terms)
 
         # 3. 构建翻译器
         _logger.info("=== 阶段 3/5: 构建匹配引擎与翻译器 ===")
@@ -227,7 +247,15 @@ class TranslationPipeline:
         for o in outcomes:
             self._record_outcome(o, summary)
 
-        # 8. 输出剖析报告
+        # 8. 新专有名词落盘（下次运行启动时合并进术语表）
+        if self._new_term_collector is not None:
+            saved = self._new_term_collector.flush()
+            if saved:
+                self._log_bridge.info(
+                    f"已记录 {saved} 条新专有名词 → {self._new_terms_path()}"
+                )
+
+        # 9. 输出剖析报告
         self._on_progress(90, "已完成汉化")
         report = profiler.report()
         self._log_bridge.info(report)
@@ -235,6 +263,34 @@ class TranslationPipeline:
         return summary
 
     # ========== 内部方法 ==========
+
+    def _new_terms_path(self) -> Path:
+        """新专有名词的落盘路径（配置为空时落在输出根目录，跨运行累积）。"""
+        if self._config.new_terms_path:
+            return Path(self._config.new_terms_path)
+        return Path(self._config.output_dir) / DEFAULT_FILE_NAME
+
+    def _merge_learned_terms(self, raw_terms: list[dict]) -> list[dict]:
+        """把本地累积的新专有名词并入术语表。
+
+        **远程表优先**：paratranz 上一旦人工收录该词，本地建议自动让位，
+        避免两边译名打架。
+        """
+        if not self._config.enable_new_terms:
+            return raw_terms
+        try:
+            learned = load_learned(self._new_terms_path())
+        except Exception as exc:  # noqa: BLE001 - 读不到就按没有处理
+            _logger.warning(f"新专有名词文件读取失败: {exc}")
+            return raw_terms
+        if not learned:
+            return raw_terms
+        merged, stats = merge_terms(raw_terms, learned)
+        self._log_bridge.info(
+            f"新专有名词回流：追加 {stats['added']} 条，"
+            f"{stats['shadowed']} 条已被远程术语表覆盖"
+        )
+        return merged
 
     def _process_one(
         self, file_path: Path, base_pc: PathConfig, has_prefix: bool, translator
@@ -247,6 +303,7 @@ class TranslationPipeline:
             translate_config=self._config,
             translator=translator,
             recorder=self._recorder,
+            new_term_collector=self._new_term_collector,
         )
         return processor.process()
 

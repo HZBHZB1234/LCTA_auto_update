@@ -125,9 +125,16 @@ class StageStrategy:
         prompt_format: str = "xml_json",
         *,
         examples: list[dict] | None = None,
+        verbosity: str = "full",
     ) -> str:
-        """构建主翻译系统提示词。自动加载 FileType 对应的 few-shot 示例。"""
-        # 自动加载 FileType 对应的 few-shot 示例
+        """构建主翻译系统提示词。自动加载 FileType 对应的 few-shot 示例。
+
+        Args:
+            verbosity: "full"（默认）| "slim"（去 P2 规则与示例）
+                | "minimal"（只留硬保护规则 + 极简输出格式）。
+                降级重试时逐级简化的入口。
+        """
+        # 自动加载 FileType 对应的 few-shot 示例（仅 full 档会真正写入提示词）
         if examples is None:
             try:
                 from translateFunc.builder.examples import get_examples
@@ -139,6 +146,7 @@ class StageStrategy:
             stage=1,
             prompt_format=prompt_format,
             examples=examples,
+            verbosity=verbosity,
         )
 
     def build_stage_1_user_prompt(
@@ -360,3 +368,7 @@ class StageStrategy:
     def consume_parse_errors(self) -> list[dict]:
         """取得最近一次阶段响应解析失败的结构化原因。"""
         return self._prompt_factory.consume_parse_errors()
+
+    def consume_new_terms(self) -> list[dict]:
+        """取得最近一次阶段 1 响应中模型回传的新专有名词。"""
+        return self._prompt_factory.consume_new_terms()

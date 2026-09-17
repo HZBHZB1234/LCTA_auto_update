@@ -4,6 +4,7 @@ MatcherEngine —— 管理全部四个 AC 自动机实例，提供统一匹配�
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import threading
 
 from translateFunc.matcher.ac_automaton import AcAutomaton, ACPattern
 
@@ -35,9 +36,13 @@ class MatcherEngine:
 
         self._role_data: list[dict] = []
         self._affect_data: list[dict] = []
+        # 专有名词原文表（term -> 词条），供热更新时整体重建 AC 自动机
+        self._proper_data: dict[str, dict] = {}
+        self._proper_lock = threading.RLock()
 
         # 确保所有 AC 自动机在翻译优先文件前已处于已构建状态，
         # 后续通过 _update_roles / _update_affects 用实际数据重建。
+        self._proper_ac.build()
         self._role_ac.build()
         self._affect_id_ac.build()
         self._affect_name_ac.build()
@@ -46,12 +51,45 @@ class MatcherEngine:
 
     def build_proper(self, proper_terms: list[dict]) -> None:
         """从 [{term, translation, note, ...}, ...] 构建专有名词 AC 自动机。"""
-        self._proper_ac = AcAutomaton()
-        for item in proper_terms:
-            term = item.get("term", "")
-            if term:
-                self._proper_ac.add_pattern(term, data=item)
-        self._proper_ac.build()
+        with self._proper_lock:
+            self._proper_data = {}
+            for item in proper_terms:
+                term = item.get("term", "")
+                if term and term not in self._proper_data:
+                    self._proper_data[term] = item
+            self._proper_ac = self._build_proper_ac(self._proper_data)
+
+    @staticmethod
+    def _build_proper_ac(terms: dict[str, dict]) -> AcAutomaton:
+        ac = AcAutomaton()
+        for term, item in terms.items():
+            ac.add_pattern(term, data=item)
+        ac.build()
+        return ac
+
+    def add_proper_terms(self, items: list[dict]) -> int:
+        """热更新：把模型新发现的专有名词并入术语表，返回新增条数。
+
+        重建后的自动机以**原子替换引用**的方式生效（``self._proper_ac = new``），
+        并发中的 ``match_proper`` / ``match_all`` 要么看到旧对象、要么看到新对象，
+        因此搜索侧无需加锁。
+        """
+        with self._proper_lock:
+            added = 0
+            for item in items or []:
+                term = (item.get("term") or "").strip()
+                if term and term not in self._proper_data:
+                    self._proper_data[term] = item
+                    added += 1
+            if added:
+                self._proper_ac = self._build_proper_ac(self._proper_data)
+        return added
+
+    @property
+    def proper_terms(self) -> dict[str, dict]:
+        """当前术语表快照（term -> 词条）。"""
+        with self._proper_lock:
+            return dict(self._proper_data)
 
     def build_roles(self, role_items: list[dict]) -> None:
         """从 [{id, kr, cn, nickName}, ...] 构建角色 AC 自动机。

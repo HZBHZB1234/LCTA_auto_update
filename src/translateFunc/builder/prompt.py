@@ -48,6 +48,8 @@ class PromptFactory:
 
     def __init__(self):
         self._last_parse_errors: list[dict] = []
+        # 最近一次解析得到的 new_terms（模型回传的新专有名词），由 consume_new_terms 取走
+        self._last_new_terms: list[dict] = []
 
     # ---- v2 提示词架构：数据驱动的规则 + 结构分离 ----
 
@@ -96,6 +98,7 @@ class PromptFactory:
         {"priority": "P1", "text": "如果术语明显不适用（如人名术语出现在技能描述中），标记为不适用"},
     ]
 
+    # 阶段 2 规则 —— 按优先级排列
     _STAGE2_RULES_DATA: list[dict] = [
         {"priority": "P0", "text": "校验翻译结果中的术语一致性（与reference术语表对照）"},
         {"priority": "P1", "text": "校验标点符号：剧情文本是否使用全角标点（！？，。：）和中文引号（“”）；技能文本是否使用半角括号()和三点省略号…"},
@@ -104,6 +107,21 @@ class PromptFactory:
         {"priority": "P2", "text": "检查JSON格式标记（如原文有前后半角引号包裹的文本）是否保留了格式引号"},
         {"priority": "P2", "text": "发现错误时自动修正，并给出具体修正说明（改了什么、为什么）"},
         {"priority": "P1", "text": "校验富文本标签 <…> 是否保持原始尖括号，未被转义为 &lt; / &gt; / %3C / %3E；发现编码化标签应改回原始 < >。"},
+    ]
+
+    # ---- 提示词档位（verbosity）----
+    # full    : 现状全量提示词（默认，输出必须逐字节稳定）
+    # slim    : 去掉 P2 风格规则与 few-shot 示例，只保留保护类与一致性规则
+    # minimal : 只保留硬性保护规则 + 极简输出格式，用于剥离复杂响应规则后的兜底重试
+    VERBOSITY_FULL = "full"
+    VERBOSITY_SLIM = "slim"
+    VERBOSITY_MINIMAL = "minimal"
+    _VERBOSITIES = (VERBOSITY_FULL, VERBOSITY_SLIM, VERBOSITY_MINIMAL)
+
+    _MINIMAL_RULES_DATA: list[dict] = [
+        {"priority": "P0", "text": "把韩文(KR)翻译为简体中文；日文(JP)和英文(EN)仅作理解辅助"},
+        {"priority": "P0", "text": "尖括号参数（如<0>、<1>）、方括号标识符（如[Bleed]）与富文本标签（如<color=…>、<b>）必须原样保留，不得翻译或转义"},
+        {"priority": "P0", "text": "reference 中给出的术语译名必须沿用"},
     ]
 
     # FileType 特有规则
@@ -156,6 +174,16 @@ class PromptFactory:
         "- 每条translation的id必须与对应text_block的id一致（按id一一对应）\n"
         "- 不得合并、拆分或跳过任何文本块；每个文本块必须且只能产出一条翻译\n"
         "confidence为low的条目说明翻译不确定，需要回退到原文。\n"
+        "另外，顶层可以额外返回new_terms数组，用于记录原文中出现但glossary未收录的专有名词：\n"
+        "{\n"
+        '  "new_terms": [\n'
+        '    {"kr": "原文中的专有名词", "cn": "你采用的中文译名",'
+        ' "category": "person|place|org|item|skill|other"}\n'
+        "  ]\n"
+        "}\n"
+        "只收录人名/地名/组织/专有物品/专有技能名等真正的专有名词；"
+        "不要收录普通词汇、句子片段、已在glossary中的词。没有则返回空数组。\n"
+        "new_terms缺失或格式有误不影响translations的判定。\n"
         "</format>\n"
     )
 
@@ -208,6 +236,7 @@ class PromptFactory:
         '    },\n'
         '    "count_constraint": "translations数组长度必须等于输入text_blocks数量；每条id必须与对应text_block的id一致",\n'
         '    "note": "confidence为low的条目说明翻译不确定，需要回退到原文",\n'
+        '    "optional_new_terms": "顶层可额外返回new_terms数组，记录原文中出现但glossary未收录的专有名词（人名/地名/组织/专有物品/专有技能名）。元素字段：kr=原文专有名词，cn=你采用的中文译名，category=person|place|org|item|skill|other。不要收录普通词汇、句子片段或已在glossary中的词；没有则返回空数组。缺失或格式有误不影响translations",\n'
         '    "escaping": "字符串值中的换行符必须写为 \\\\n，双引号必须写为 \\\\"，反斜杠必须写为 \\\\\\\\；确保输出是合法JSON"\n'
         '  }\n'
         '}\n'
@@ -266,6 +295,18 @@ class PromptFactory:
         "- 每个item的id必须与对应text_block的id一致（按id一一对应）\n"
         "- 不得合并、拆分或跳过任何文本块；每个文本块必须且只能产出一条翻译\n"
         "confidence为low的条目说明翻译不确定，需要回退到原文。\n"
+        "另外，可以在<translations>内部、全部item之后额外追加<new_terms>，"
+        "用于记录原文中出现但glossary未收录的专有名词：\n"
+        "<new_terms>\n"
+        "  <term>\n"
+        "    <kr>原文中的专有名词</kr>\n"
+        "    <cn>你采用的中文译名</cn>\n"
+        "    <category>person|place|org|item|skill|other</category>\n"
+        "  </term>\n"
+        "</new_terms>\n"
+        "只收录人名/地名/组织/专有物品/专有技能名等真正的专有名词；"
+        "不要收录普通词汇、句子片段、已在glossary中的词。没有则省略该元素。\n"
+        "new_terms缺失或格式有误不影响translations的判定。\n"
         "</format>\n"
     )
 
@@ -288,6 +329,50 @@ class PromptFactory:
         "  </item>\n"
         "</checked_translations>\n"
         "</format>\n"
+    )
+
+    # ---- 极简输出格式（verbosity="minimal" 专用）----
+    # 用于「剥离复杂响应规则」后的兜底重试：去掉 reasoning / confidence /
+    # 数量长约束 / new_terms，只留 id 与 translation，把模型出错面压到最小。
+
+    _STAGE1_FORMAT_MINIMAL = (
+        "<format>\n"
+        "只返回JSON对象：\n"
+        "{\n"
+        '  "translations": [\n'
+        '    {"id": 1, "translation": "译文"}\n'
+        "  ]\n"
+        "}\n"
+        "translations长度必须等于输入text_blocks数量，每个id按输入顺序从1开始，不得遗漏或合并。\n"
+        "</format>\n"
+    )
+
+    _XML_STAGE1_FORMAT_XML_MINIMAL = (
+        "<format>\n"
+        "只返回XML：\n"
+        "<translations>\n"
+        '  <item id="1">\n'
+        "    <translation>译文</translation>\n"
+        "  </item>\n"
+        "</translations>\n"
+        "item数量必须等于输入text_blocks数量，每个id按输入顺序从1开始，不得遗漏或合并。\n"
+        "</format>\n"
+    )
+
+    _JSON_STAGE1_FORMAT_MINIMAL = (
+        '{\n'
+        '  "format": {\n'
+        '    "response_type": "json_object",\n'
+        '    "description": "只返回translations字段",\n'
+        '    "schema": {\n'
+        '      "translations": [\n'
+        '        {"id": 1, "translation": "译文"}\n'
+        '      ]\n'
+        '    },\n'
+        '    "count_constraint": "translations长度必须等于输入text_blocks数量，每个id按输入顺序从1开始",\n'
+        '    "escaping": "字符串值中的换行符必须写为 \\\\n，双引号必须写为 \\\\"，反斜杠必须写为 \\\\\\\\；确保输出是合法JSON"\n'
+        '  }\n'
+        '}\n'
     )
 
     # ========== 工具方法 ==========
@@ -390,6 +475,7 @@ class PromptFactory:
         prompt_format: str = "xml_json",
         *,
         examples: list[dict] | None = None,
+        verbosity: str = "full",
     ) -> str:
         """为给定文件类型、阶段和格式构建系统提示词。
 
@@ -398,21 +484,28 @@ class PromptFactory:
             stage: 0（消歧）、1（翻译）、2（自校验）
             prompt_format: "xml_json" | "xml_xml" | "json_json"
             examples: 可选的 few-shot 示例
+            verbosity: "full"（默认，逐字节稳定）| "slim"（去 P2 规则与示例）
+                | "minimal"（只留硬保护规则 + 极简输出格式）
         """
-        return self._build_system_prompt(file_type, stage, prompt_format, examples=examples)
+        return self._build_system_prompt(
+            file_type, stage, prompt_format, examples=examples, verbosity=verbosity,
+        )
 
     def _build_system_prompt(
         self, file_type: FileType, stage: int, prompt_format: str, *,
         examples: list[dict] | None = None,
+        verbosity: str = "full",
     ) -> str:
         """构建系统提示词：
         role → translation_rules → format_rules → examples → output_format
 
         rules 带 priority 标记，reasoning 在 translation 之前。
         format_rules 按响应格式（JSON/XML）选择，避免转义指令混淆。
+        verbosity 控制规则裁剪：full 档输出必须保持逐字节稳定。
         """
         is_json = (prompt_format == "json_json")
         is_xml_response = (prompt_format == "xml_xml")
+        verbosity = verbosity if verbosity in self._VERBOSITIES else self.VERBOSITY_FULL
 
         parts: list[str] = []
 
@@ -426,10 +519,19 @@ class PromptFactory:
         if stage == 0:
             rules_data = self._STAGE0_RULES_DATA
         elif stage == 1:
-            rules_data = list(self._STAGE1_RULES_DATA)
-            # FileType 特有规则
-            if file_type.name in self._FILETYPE_RULES:
-                rules_data.extend(self._FILETYPE_RULES[file_type.name])
+            if verbosity == self.VERBOSITY_MINIMAL:
+                # 极简档：完全丢弃风格规则与 FileType 特有规则，
+                # 只留「不能翻坏」的硬保护，把模型出错面压到最小。
+                rules_data = list(self._MINIMAL_RULES_DATA)
+            else:
+                rules_data = list(self._STAGE1_RULES_DATA)
+                # FileType 特有规则
+                if file_type.name in self._FILETYPE_RULES:
+                    rules_data.extend(self._FILETYPE_RULES[file_type.name])
+                if verbosity == self.VERBOSITY_SLIM:
+                    # 精简档：去掉 P2 风格类规则（省略号/波浪号/括号/引号），
+                    # 保留 P0/P1 的保护与一致性约束。
+                    rules_data = [r for r in rules_data if r["priority"] != "P2"]
         elif stage == 2:
             rules_data = list(self._STAGE2_RULES_DATA)
             # FileType 特有规则
@@ -443,6 +545,7 @@ class PromptFactory:
 
         # 3. Format Rules (technical escape rules, only for stage 1)
         #    按响应格式选择：JSON 响应用 JSON 转义规则，XML 响应用 XML 转义规则
+        #    极简档仍保留转义规则——去掉它会让响应本身变成非法 JSON/XML。
         if stage == 1:
             format_rules = list(self._COMMON_FORMAT_RULES_DATA)
             if is_xml_response:
@@ -452,13 +555,18 @@ class PromptFactory:
             if format_rules:
                 parts.append(self._render_format_rules(format_rules, is_json=is_json))
 
-        # 4. Examples
-        if examples and not is_json:
-            parts.append(self._render_examples(examples))
-        elif examples and is_json:
-            parts.append(self._render_examples_json(examples))
+        # 4. Examples（仅 full 档：few-shot 很长，降级重试时反而是噪音）
+        if verbosity == self.VERBOSITY_FULL and examples:
+            if is_json:
+                parts.append(self._render_examples_json(examples))
+            else:
+                parts.append(self._render_examples(examples))
 
         # 5. Output Format (last, as concrete instruction)
+        if stage == 1 and verbosity == self.VERBOSITY_MINIMAL:
+            parts.append(self._minimal_stage1_format(prompt_format))
+            return "\n".join(parts)
+
         if is_json:
             if stage == 0:
                 parts.append(self._JSON_STAGE0_FORMAT)
@@ -475,6 +583,14 @@ class PromptFactory:
                 parts.append(self._XML_STAGE2_FORMAT_XML if is_xml_response else self._XML_STAGE2_FORMAT)
 
         return "\n".join(parts)
+
+    def _minimal_stage1_format(self, prompt_format: str) -> str:
+        """极简档的输出格式模板（按响应格式选择）。"""
+        if prompt_format == "json_json":
+            return self._JSON_STAGE1_FORMAT_MINIMAL
+        if prompt_format == "xml_xml":
+            return self._XML_STAGE1_FORMAT_XML_MINIMAL
+        return self._STAGE1_FORMAT_MINIMAL
 
     # ========== v2 渲染辅助方法 ==========
 
@@ -656,6 +772,7 @@ class PromptFactory:
             解析后的 dict 列表；所有尝试失败返回空列表
         """
         self._last_parse_errors = []
+        self._last_new_terms = []
         if prompt_format in ("xml_json", "json_json"):
             data = self._try_parse_json(text)
             if data is None:
@@ -696,6 +813,9 @@ class PromptFactory:
                         "message": f"响应缺少或清空了字段 {expected_key}",
                         "available_keys": list(data.keys()) if isinstance(data, dict) else [],
                     })
+            if stage == 1:
+                # new_terms 是附加产出：提取失败绝不影响 translations 的判定
+                self._last_new_terms = self._extract_new_terms_json(data)
             return result
         elif prompt_format == "xml_xml":
             results = self._try_parse_xml(text, stage)
@@ -718,6 +838,8 @@ class PromptFactory:
                     f"原始文本 (截断500字符): {text[:500]}"
                 )
                 return []
+            if stage == 1:
+                self._last_new_terms = self._extract_new_terms_xml(text)
             return results
         self._last_parse_errors.append({
             "type": "UnsupportedPromptFormat",
@@ -730,6 +852,69 @@ class PromptFactory:
         errors = list(self._last_parse_errors)
         self._last_parse_errors = []
         return errors
+
+    def consume_new_terms(self) -> list[dict]:
+        """返回并清空最近一次解析得到的 new_terms（模型回传的新专有名词）。
+
+        返回 ``[{kr, cn, category}, ...]``；未经清洗，交由 NewTermCollector 过滤。
+        """
+        items = self._last_new_terms
+        self._last_new_terms = []
+        return items
+
+    @staticmethod
+    def _extract_new_terms_json(data) -> list[dict]:
+        """从 JSON 响应中提取 new_terms。任何异常都按空列表处理。"""
+        try:
+            if not isinstance(data, dict):
+                return []
+            raw = data.get("new_terms")
+            if not isinstance(raw, list):
+                return []
+            items: list[dict] = []
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                kr = entry.get("kr", entry.get("term", ""))
+                cn = entry.get("cn", entry.get("translation", ""))
+                if not isinstance(kr, str) or not isinstance(cn, str):
+                    continue
+                if not kr.strip() or not cn.strip():
+                    continue
+                category = entry.get("category", "other")
+                items.append({
+                    "kr": kr,
+                    "cn": cn,
+                    "category": category if isinstance(category, str) else "other",
+                })
+            return items
+        except Exception:  # noqa: BLE001 - 附加产出，绝不因它中断主流程
+            return []
+
+    @staticmethod
+    def _extract_new_terms_xml(text: str) -> list[dict]:
+        """从 XML 响应中提取 <new_terms>。任何异常都按空列表处理。"""
+        import re
+        try:
+            block = re.search(
+                r"<new_terms>(.*?)</new_terms>", text, re.DOTALL | re.IGNORECASE
+            )
+            if not block:
+                return []
+            items: list[dict] = []
+            for match in re.finditer(
+                r"<term>(.*?)</term>", block.group(1), re.DOTALL | re.IGNORECASE
+            ):
+                body = match.group(1)
+                scratch: dict = {}
+                kr = _extract_tag(body, "kr", scratch)
+                cn = _extract_tag(body, "cn", scratch)
+                category = _extract_tag(body, "category", scratch, default="other")
+                if kr.strip() and cn.strip():
+                    items.append({"kr": kr, "cn": cn, "category": category})
+            return items
+        except Exception:  # noqa: BLE001 - 附加产出，绝不因它中断主流程
+            return []
 
     # ========== 解析辅助：直接尝试 ==========
 

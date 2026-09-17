@@ -238,6 +238,56 @@ class RequestBuilder:
                 self.max_length, max_parts, details,
             )
 
+    # ========== 子请求（补充翻译 / 降级重试） ==========
+
+    def build_part_request(self, blocks: list[dict], *, slim: bool = False) -> dict:
+        """由若干文本块构造子请求。
+
+        补充翻译与降级重试共用同一套构造逻辑，避免两处口径漂移。
+
+        Args:
+            blocks: 参与本次子请求的文本块
+            slim: True 时只保留这些块实际引用的专有名词，砍掉
+                affects / models / model_docs / skill_doc —— 用于
+                「剥离复杂响应规则」档位，把请求压到最小。
+        """
+        reference = self.unified_request.get("reference", {}) if self.unified_request else {}
+
+        proper_refs: set[str] = set()
+        for block in blocks:
+            proper_refs.update(block.get("proper_refs", []))
+
+        part_reference: dict = {
+            "proper_terms": [
+                t for t in reference.get("proper_terms", [])
+                if t.get("term", "") in proper_refs
+            ],
+        }
+        if not slim:
+            affect_refs: set[str] = set()
+            for block in blocks:
+                affect_refs.update(block.get("affect_refs", []))
+            part_reference.update({
+                "affects": [
+                    a for a in reference.get("affects", [])
+                    if f'[{a.get("id", "")}]' in affect_refs
+                ],
+                "models": reference.get("models", []),
+                "model_docs": reference.get("model_docs", []),
+                "skill_doc": reference.get("skill_doc", ""),
+            })
+
+        metadata: dict = dict(self.unified_request.get("metadata", {})) if self.unified_request else {}
+        metadata["total_text_blocks"] = len(blocks)
+        if slim:
+            metadata["slim_reference"] = True
+
+        return {
+            "metadata": metadata,
+            "reference": part_reference,
+            "text_blocks": list(blocks),
+        }
+
     # ========== 输出 ==========
 
     def get_request_text(self, prompt_format: str = "xml_json") -> list[str]:

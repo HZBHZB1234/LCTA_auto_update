@@ -40,6 +40,21 @@ class TranslateConfig:
     min_confidence: str = "medium"            # "high" | "medium" | "low"
     prompt_format: str = "xml_json"           # "xml_json" | "xml_xml" | "json_json"
 
+    # --- 失败降级阶梯（翻译失败不再直接回退韩文，而是逐级加码挽救）---
+    # L1 切更小块 → L2 精简提示词 → L3 剥离复杂响应规则 → 仍失败才回退
+    enable_retry_escalation: bool = True
+    retry_max_level: int = 3          # 0 = 关闭阶梯（行为与旧版一致）
+    retry_chunk_size: int = 8         # 单次重试请求包含的最大文本块数
+    retry_max_calls_per_part: int = 4  # 单个 part 的阶梯调用硬预算
+    retry_split_depth: int = 1        # L1 内二分递归层数（保守预算下默认只切一刀）
+
+    # --- 新专有名词的发现与回流（模型在响应中回报名词，下次输入时并入术语表）---
+    enable_new_terms: bool = True
+    new_terms_path: str = ""          # 空 = <output_dir>/proper_learned.json
+    new_terms_min_votes: int = 1      # 至少被这么多条响应提到才收录
+    new_terms_hot_update: bool = True  # 本次运行内即时热更新术语表
+    new_terms_hot_update_batch: int = 20  # 累积多少条新词触发一次热更新
+
     # --- 保存 ---
     save_result: bool = True
 
@@ -99,6 +114,16 @@ class TranslateConfig:
             prompt_format=configs.get("prompt_format", "xml_json"),
             enable_thinking=configs.get("enable_thinking", False),
             enable_rule_validation=configs.get("enable_rule_validation", True),
+            enable_retry_escalation=configs.get("enable_retry_escalation", True),
+            retry_max_level=configs.get("retry_max_level", 3),
+            retry_chunk_size=configs.get("retry_chunk_size", 8),
+            retry_max_calls_per_part=configs.get("retry_max_calls_per_part", 4),
+            retry_split_depth=configs.get("retry_split_depth", 1),
+            enable_new_terms=configs.get("enable_new_terms", True),
+            new_terms_path=configs.get("new_terms_path", ""),
+            new_terms_min_votes=configs.get("new_terms_min_votes", 1),
+            new_terms_hot_update=configs.get("new_terms_hot_update", True),
+            new_terms_hot_update_batch=configs.get("new_terms_hot_update_batch", 20),
         )
 
 

@@ -36,12 +36,30 @@ EMPTY_DATA = [{"dataList": []}, {}, []]
 EMPTY_DATA_LIST = [[], [{}]]
 SUCCESS_CALL_STATUSES = {"success", "recovered"}
 
+# 置信度排序：低于 min_confidence 的条目回退，并纳入降级重试
+_CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
+
 # 韩文（Hangul）码位：谚文音节 + 字母 + 兼容字母。
 # 用于识别「模型把待翻译的韩文原文原样回填」这种最典型的漏翻。
 _RE_HANGUL = re.compile(r"[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]")
 
 # 保护 processing_log.jsonl 的并发写入
 _processing_log_lock = threading.Lock()
+
+
+def _chunk_evenly(items: list, n: int) -> list[list]:
+    """把 items 尽量均匀地分成 n 组，保持原有顺序。"""
+    if not items:
+        return []
+    n = max(1, min(int(n), len(items)))
+    size, remainder = divmod(len(items), n)
+    groups: list[list] = []
+    start = 0
+    for i in range(n):
+        end = start + size + (1 if i < remainder else 0)
+        groups.append(list(items[start:end]))
+        start = end
+    return groups
 
 
 def contains_hangul(text) -> bool:
@@ -76,12 +94,14 @@ class FileProcessor:
         translate_config: TranslateConfig,
         translator,  # translatekit TranslatorBase 实例
         recorder: "TranslationRecorder" = None,
+        new_term_collector=None,  # proper.new_terms.NewTermCollector，可为 None
     ):
         self.path_config = path_config
         self._engine = engine
         self._config = translate_config
         self._translator = translator
         self._recorder = recorder
+        self._new_term_collector = new_term_collector
 
         self._api_calls: list[dict] = []
         self._input_text_blocks: list[dict] = []
@@ -658,9 +678,10 @@ class FileProcessor:
 
                 part_result = None
                 tried_formats: list[str] = []
-                retry_indices: list[int] = []
                 selected_call_record: dict | None = None
                 failed_format_calls: list[dict] = []
+                # 本 part 内由格式循环判定出的未解决文本块：{索引: 原因}
+                cycle_unresolved: dict[int, str] = {}
 
                 for fmt_idx, fmt in enumerate(formats_chain):
                     call_record = None
@@ -742,6 +763,9 @@ class FileProcessor:
                         if not parsed:
                             raise ValueError(f"{fmt}: 解析结果为空")
 
+                        # 顺带收集模型回传的新专有名词（收集失败不影响主流程）
+                        self._harvest_new_terms(stage_strategy, stage="stage_1", part_idx=i)
+
                         # 按 id 对齐解析结果与文本块（解决 LLM 跳过/重排条目导致的错位）
                         text_blocks = part_data.get("text_blocks", [])
                         expected_count = len(text_blocks)
@@ -758,7 +782,6 @@ class FileProcessor:
                                     continue
 
                         # 置信度检查准备
-                        _CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
                         threshold = _CONFIDENCE_ORDER.get(self._config.min_confidence, 1)
                         low_conf_count = 0
                         low_confidence_ids: list[int] = []
@@ -842,10 +865,11 @@ class FileProcessor:
                                 f" (min={self._config.min_confidence}) 回退为 KR 原文"
                             )
 
-                        retry_indices = sorted({
-                            *(expected_id - 1 for expected_id in missing_ids),
-                            *(expected_id - 1 for expected_id in low_confidence_ids),
-                        })
+                        for expected_id in missing_ids:
+                            cycle_unresolved.setdefault(expected_id - 1, "missing_translation")
+                        for expected_id in low_confidence_ids:
+                            cycle_unresolved.setdefault(expected_id - 1, "low_confidence")
+
                         selected_call_record = call_record
                         break  # 翻译完整，退出格式回退循环
 
@@ -857,92 +881,93 @@ class FileProcessor:
                         )
                         continue
 
+                text_blocks = part_data.get("text_blocks", [])
                 if part_result is None:
-                    # 全部格式失败 → 无条件 warning + 标记降级
+                    # 全部格式解析失败：不再直接回退 KR，先交给降级阶梯挽救
                     _logger.warning(
                         f"[{self.file_name}] 全部格式 ({', '.join(tried_formats)}) "
-                        f"解析失败，第 {i + 1}/{len(builder.split_requests)} 部分回退为 KR 原文"
+                        f"解析失败，第 {i + 1}/{len(builder.split_requests)} 部分进入降级重试"
                     )
-                    had_fallback = True
-                    text_blocks = part_data.get("text_blocks", [])
                     part_result = [b.get("kr", "") for b in text_blocks]
+                    for idx in range(len(text_blocks)):
+                        cycle_unresolved.setdefault(idx, "all_formats_failed")
+
+                # 统一未解决集合：格式循环判定的缺失/低置信度 + 韩文原样回填
+                unresolved = self._collect_unresolved(
+                    part_result, text_blocks, cycle_unresolved,
+                )
+
+                # 降级阶梯：L1 切更小块 → L2 精简提示词 → L3 剥离复杂响应规则
+                fixed_by_level: dict[int, str] = {}
+                if unresolved:
+                    fixed_by_level, _ = self._escalate_retry(
+                        builder, stage_strategy, part_data, part_result,
+                        unresolved, i, user_format,
+                    )
+
+                remaining = {
+                    idx: reason for idx, reason in unresolved.items()
+                    if idx not in fixed_by_level
+                }
+                remaining_hangul = [
+                    idx for idx, reason in remaining.items()
+                    if reason == "untranslated_hangul"
+                ]
+                if remaining_hangul:
+                    self._record_diagnostic_event(
+                        stage="hangul_check",
+                        status="fallback",
+                        failure_kind="untranslated_hangul",
+                        prompt_format=user_format,
+                        part=i + 1,
+                        validation_errors=[{
+                            "count": len(remaining_hangul),
+                            "ids": [idx + 1 for idx in remaining_hangul[:10]],
+                            "action": "keep_model_output",
+                        }],
+                        metadata={
+                            "hangul_detected": sum(
+                                1 for reason in unresolved.values()
+                                if reason == "untranslated_hangul"
+                            ),
+                            "fixed_by_retry": sum(
+                                1 for idx in fixed_by_level
+                                if unresolved.get(idx) == "untranslated_hangul"
+                            ),
+                            "samples": [
+                                {
+                                    "id": idx + 1,
+                                    "source": str(text_blocks[idx].get("kr", ""))[:120],
+                                    "translation": str(part_result[idx])[:120],
+                                }
+                                for idx in remaining_hangul[:5]
+                            ],
+                        },
+                    )
+                    _logger.warning(
+                        f"[{self.file_name}] {len(remaining_hangul)} 条译文经降级重试后仍含韩文"
+                        f"（id: {[idx + 1 for idx in remaining_hangul[:10]]}...），"
+                        f"按兜底语义保留模型输出并写入 dump"
+                    )
+
+                if remaining:
+                    had_fallback = True
+                    _logger.warning(
+                        f"[{self.file_name}] 第 {i + 1}/{len(builder.split_requests)} 部分"
+                        f"仍有 {len(remaining)} 个文本块未被挽救，按既定兜底语义落盘"
+                    )
                 else:
-                    # P1-2: 部分格式成功但存在缺失条目 → 补充翻译重试
-                    text_blocks = part_data.get("text_blocks", [])
-                    # 韩文回填检测：源(KR)含韩文而译文仍含韩文 = 漏翻，纳入重试
-                    hangul_indices = [
-                        idx
-                        for idx, block in enumerate(text_blocks)
-                        if is_untranslated_hangul(
-                            part_result[idx] if idx < len(part_result) else "",
-                            block.get("kr", ""),
-                        )
-                    ]
-                    retry_targets = sorted(set(retry_indices) | set(hangul_indices))
-                    unresolved_count = len(retry_targets)
-                    supplemental_call = None
-                    if retry_targets and len(retry_targets) < len(text_blocks):
-                        fixed = self._retry_missing_entries(
-                            builder, stage_strategy, part_data, part_result,
-                            retry_targets, tried_formats, i,
-                        )
-                        supplemental_call = self._api_calls[-1] if self._api_calls else None
-                        unresolved_count -= fixed
+                    self._mark_call_recovered(
+                        selected_call_record,
+                        recovery_kind="retry_escalation",
+                    )
 
-                    remaining_hangul = [
-                        idx
-                        for idx in hangul_indices
-                        if idx < len(part_result)
-                        and is_untranslated_hangul(
-                            part_result[idx], text_blocks[idx].get("kr", "")
-                        )
-                    ]
-                    if remaining_hangul:
-                        self._record_diagnostic_event(
-                            stage="hangul_check",
-                            status="fallback",
-                            failure_kind="untranslated_hangul",
-                            prompt_format=user_format,
-                            part=i + 1,
-                            validation_errors=[{
-                                "count": len(remaining_hangul),
-                                "ids": [idx + 1 for idx in remaining_hangul[:10]],
-                                "action": "keep_model_output",
-                            }],
-                            metadata={
-                                "hangul_detected": len(hangul_indices),
-                                "fixed_by_retry": len(hangul_indices) - len(remaining_hangul),
-                                "samples": [
-                                    {
-                                        "id": idx + 1,
-                                        "source": str(text_blocks[idx].get("kr", ""))[:120],
-                                        "translation": str(part_result[idx])[:120],
-                                    }
-                                    for idx in remaining_hangul[:5]
-                                ],
-                            },
-                        )
-                        _logger.warning(
-                            f"[{self.file_name}] {len(remaining_hangul)} 条译文仍含韩文"
-                            f"（id: {[idx + 1 for idx in remaining_hangul[:10]]}...），"
-                            f"补充翻译未能修正，已标记为 fallback 并写入 dump"
-                        )
-
-                    if unresolved_count > 0 or remaining_hangul:
-                        had_fallback = True
-                    else:
-                        self._mark_call_recovered(
-                            selected_call_record,
-                            recovery_kind="supplemental_translation",
-                            recovered_by=supplemental_call,
-                        )
-
-                    for failed_call in failed_format_calls:
-                        self._mark_call_recovered(
-                            failed_call,
-                            recovery_kind="format_fallback",
-                            recovered_by=selected_call_record,
-                        )
+                for failed_call in failed_format_calls:
+                    self._mark_call_recovered(
+                        failed_call,
+                        recovery_kind="format_fallback",
+                        recovered_by=selected_call_record,
+                    )
 
                 result.extend(part_result)
 
@@ -1157,6 +1182,15 @@ class FileProcessor:
             )
         return result
 
+    # ========== 失败降级阶梯 ==========
+
+    # 级别定义：(标记, 提示词档位, 是否精简 reference)
+    _RETRY_LEVELS: tuple[tuple[str, str, bool], ...] = (
+        ("L1", "full", False),      # 切更小块
+        ("L2", "slim", False),      # 精简提示词
+        ("L3", "minimal", True),    # 剥离复杂响应规则 + 最小 reference
+    )
+
     def _retry_missing_entries(
         self,
         builder: "RequestBuilder",
@@ -1167,147 +1201,427 @@ class FileProcessor:
         tried_formats: list[str],
         part_idx: int,
     ) -> int:
-        """P1-2: 对全部格式均缺失的条目发起补充翻译重试。
+        """对指定索引发起补充翻译，返回成功修复的条目数。
 
-        仅当 part_result 非空且缺失条目数 < 总条目数时调用——部分成功部分
-        失败才发起补充翻译（全部失败时补充请求等同于完整重试，无意义）。
+        保留旧签名（历史调用方与诊断用例依赖），内部走完整阶梯的前几级；
+        需要自定义未解决原因时直接用 ``_escalate_retry``。
+        """
+        if not kr_fallback_indices:
+            return 0
+        primary_format = tried_formats[0] if tried_formats else self._config.prompt_format
+        unresolved = {idx: "missing_translation" for idx in kr_fallback_indices}
+        fixed, _ = self._escalate_retry(
+            builder, stage_strategy, part_data, part_result,
+            unresolved, part_idx, primary_format,
+        )
+        return len(fixed)
+
+    def _collect_unresolved(
+        self,
+        part_result: list,
+        text_blocks: list[dict],
+        seeded: dict[int, str] | None = None,
+    ) -> dict[int, str]:
+        """汇总一个 part 内所有未解决的文本块：``{索引: 原因}``。
+
+        合并三类来源：格式循环已判定出的缺失/低置信度，以及此处新增的
+        「源含韩文而译文仍含韩文」漏翻检测。只有 KR 非空的块才会被判为未解决
+        ——KR 本来就是空/纯符号的块，译文为空属正常。
+        """
+        unresolved = dict(seeded or {})
+        for idx, block in enumerate(text_blocks):
+            if idx in unresolved:
+                continue
+            translation = part_result[idx] if idx < len(part_result) else ""
+            if is_untranslated_hangul(translation, block.get("kr", "")):
+                unresolved[idx] = "untranslated_hangul"
+            elif not isinstance(translation, str) or not translation.strip():
+                kr = block.get("kr", "")
+                if isinstance(kr, str) and kr.strip():
+                    unresolved[idx] = "empty_translation"
+        return unresolved
+
+    def _escalate_retry(
+        self,
+        builder: "RequestBuilder",
+        stage_strategy: "StageStrategy",
+        part_data: dict,
+        part_result: list,
+        unresolved: dict[int, str],
+        part_idx: int,
+        primary_format: str,
+    ) -> tuple[dict[int, str], list[dict]]:
+        """对未解决的文本块执行降级阶梯挽救。
+
+        L1 切更小块 → L2 精简提示词 → L3 剥离复杂响应规则。每一级只处理上一级
+        仍未解决的索引，调用次数受 ``retry_max_calls_per_part`` 硬预算约束。
+        预算耗尽或级别穷尽后，未修复的块交由调用方按既定兜底语义处理
+        （缺失回退 KR、韩文回填保留模型输出）。
 
         Returns:
-            成功修复的条目数。
+            ``({索引: 修复来源级别}, 每级尝试记录)``
         """
+        fixed: dict[int, str] = {}
+        attempts: list[dict] = []
+
+        if not self._config.enable_retry_escalation or self._config.retry_max_level <= 0:
+            return fixed, attempts
+
         text_blocks = part_data.get("text_blocks", [])
-        missing_blocks = [text_blocks[idx] for idx in kr_fallback_indices]
+        targets = [idx for idx in sorted(unresolved) if 0 <= idx < len(text_blocks)]
+        if not targets:
+            return fixed, attempts
 
-        miss_proper_refs: set[str] = set()
-        miss_affect_refs: set[str] = set()
-        for block in missing_blocks:
-            miss_proper_refs.update(block.get("proper_refs", []))
-            miss_affect_refs.update(block.get("affect_refs", []))
+        budget = max(0, int(self._config.retry_max_calls_per_part))
+        max_level = max(0, min(int(self._config.retry_max_level), len(self._RETRY_LEVELS)))
+        if budget <= 0 or max_level <= 0:
+            return fixed, attempts
 
-        ref = builder.unified_request.get("reference", {})
-        miss_reference = {
-            "proper_terms": [t for t in ref.get("proper_terms", [])
-                            if t.get("term", "") in miss_proper_refs],
-            "affects": [a for a in ref.get("affects", [])
-                       if f'[{a.get("id", "")}]' in miss_affect_refs],
-            "models": ref.get("models", []),
-            "model_docs": ref.get("model_docs", []),
-            "skill_doc": ref.get("skill_doc", ""),
-        }
-        supp_request = {
-            "metadata": {
-                **builder.unified_request["metadata"],
-                "total_text_blocks": len(missing_blocks),
-            },
-            "reference": miss_reference,
-            "text_blocks": missing_blocks,
-        }
-
-        primary_format = tried_formats[0] if tried_formats else "xml_json"
-        supp_user_text = builder._get_request_text(supp_request, primary_format)
+        used = 0
 
         _logger.info(
-            f"[{self.file_name}] P1-2 补充翻译: {len(kr_fallback_indices)} 个缺失条目 "
-            f"(原 id: {[idx + 1 for idx in kr_fallback_indices][:10]}...)"
-            f" | 请求长度={len(supp_user_text)}"
+            f"[{self.file_name}] 降级重试: 第 {part_idx + 1} 部分 "
+            f"{len(targets)} 个未解决块 (预算 {budget} 次调用) | "
+            f"原因: {self._summarize_reasons(unresolved, targets)}"
         )
 
-        system_prompt = stage_strategy.build_stage_1_prompt(
-            self.file_type, prompt_format=primary_format,
-        )
+        for level in range(1, max_level + 1):
+            if not targets or used >= budget:
+                break
+            level_name, verbosity, slim_ref = self._RETRY_LEVELS[level - 1]
+            groups = self._plan_retry_groups(targets, level, budget - used)
+            for group_idx, group in enumerate(groups):
+                if used >= budget:
+                    break
+                used += 1
+                recovered, call_record = self._retry_group(
+                    builder, stage_strategy, part_result, text_blocks, group,
+                    level=level, level_name=level_name, verbosity=verbosity,
+                    slim_ref=slim_ref, prompt_format=primary_format,
+                    part_idx=part_idx, group_idx=group_idx,
+                    group_count=len(groups), attempts=attempts,
+                )
+                for idx in recovered:
+                    fixed.setdefault(idx, level_name)
+                if len(recovered) == len(group):
+                    # 本组全部修复：该次调用若出于失败状态，改判为已恢复
+                    self._mark_call_recovered(
+                        call_record, recovery_kind=f"retry_{level_name.lower()}",
+                    )
+            targets = [idx for idx in targets if idx not in fixed]
+            if not targets:
+                break
 
-        supp_call_started = False
-        try:
-            self._update_translator_prompt(
-                system_prompt, self._format_to_response_format(primary_format),
-            )
-            timeout = max(len(supp_user_text) * 3 // 400 + 40, 60)
-            supp_call_started = True
-            _, supp_parsed, call_record = self._call_ai(
-                stage="p1_2",
-                system_prompt=system_prompt,
-                user_prompt=supp_user_text,
-                response_format=self._format_to_response_format(primary_format),
-                timeout=timeout,
-                parser=lambda response: stage_strategy.parse_stage_1_result(
-                    response, prompt_format=primary_format,
-                ),
-                parse_error_provider=stage_strategy.consume_parse_errors,
+        if targets:
+            self._record_diagnostic_event(
+                stage="retry_exhausted",
+                status="fallback",
+                failure_kind="retry_escalation_exhausted",
                 prompt_format=primary_format,
                 part=part_idx + 1,
-                attempt=1,
+                validation_errors=[{
+                    "unresolved_ids": [idx + 1 for idx in targets],
+                    "reasons": {str(idx + 1): unresolved.get(idx, "") for idx in targets},
+                    "action": "fallback_to_source",
+                }],
+                metadata={"attempts": attempts, "budget": budget, "used": used},
+            )
+            _logger.warning(
+                f"[{self.file_name}] 降级重试已穷尽 ({used}/{budget} 次调用)，"
+                f"仍有 {len(targets)} 个文本块未修复 "
+                f"(id: {[idx + 1 for idx in targets][:10]}...)，转入既定兜底语义"
+            )
+        else:
+            by_level: dict[str, int] = {}
+            for level_name in fixed.values():
+                by_level[level_name] = by_level.get(level_name, 0) + 1
+            self._record_diagnostic_event(
+                stage="retry_summary",
+                status="success",
+                prompt_format=primary_format,
+                part=part_idx + 1,
                 metadata={
-                    "missing_source_ids": [idx + 1 for idx in kr_fallback_indices],
+                    "rescued": len(fixed),
+                    "by_level": by_level,
+                    "calls_used": used,
+                    "attempts": attempts,
+                },
+            )
+            _logger.info(
+                f"[{self.file_name}] 降级重试成功: 挽救 {len(fixed)} 个文本块 "
+                f"({', '.join(f'{k}={v}' for k, v in sorted(by_level.items()))}，"
+                f"共 {used} 次调用)"
+            )
+
+        return fixed, attempts
+
+    @staticmethod
+    def _summarize_reasons(unresolved: dict[int, str], targets: list[int]) -> str:
+        """把未解决原因汇总成 ``reason=count`` 形式，便于日志与 dump 统计。"""
+        counts: dict[str, int] = {}
+        for idx in targets:
+            reason = unresolved.get(idx, "unknown")
+            counts[reason] = counts.get(reason, 0) + 1
+        return ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+
+    def _plan_retry_groups(
+        self, targets: list[int], level: int, budget_left: int,
+    ) -> list[list[int]]:
+        """按级别与剩余预算规划本次重试的分组。
+
+        L1 是「切更小块」，尽量按 ``retry_chunk_size`` 切分，但会为后续级别各留
+        至少一次调用机会——预算花光却只试过一种手段是最坏的结果。L2/L3 优先保证
+        「换提示词档位」这一变量确实被验证过，因此切分后直接受剩余预算约束。
+        """
+        if not targets:
+            return []
+        budget_left = max(1, budget_left)
+        chunk = max(1, int(self._config.retry_chunk_size))
+        wanted = max(1, (len(targets) + chunk - 1) // chunk)
+        if level == 1:
+            wanted = min(wanted, max(1, budget_left - 2))
+        else:
+            wanted = min(wanted, budget_left)
+        return _chunk_evenly(targets, wanted)
+
+    def _retry_group(
+        self,
+        builder: "RequestBuilder",
+        stage_strategy: "StageStrategy",
+        part_result: list,
+        text_blocks: list[dict],
+        group: list[int],
+        *,
+        level: int,
+        level_name: str,
+        verbosity: str,
+        slim_ref: bool,
+        prompt_format: str,
+        part_idx: int,
+        group_idx: int,
+        group_count: int,
+        attempts: list[dict],
+    ) -> tuple[list[int], dict | None]:
+        """按指定档位重试一组文本块，返回 ``(被修复的索引, 调用记录)``。"""
+        stage = f"retry_{level_name}"
+        blocks = [text_blocks[idx] for idx in group]
+        request = self._build_retry_request(builder, blocks, slim=slim_ref)
+        system_prompt = self._build_retry_prompt(
+            stage_strategy, verbosity=verbosity, prompt_format=prompt_format,
+        )
+        user_text = self._render_retry_prompt(builder, request, prompt_format)
+
+        attempt_record = {
+            "level": level_name,
+            "group": group_idx + 1,
+            "group_count": group_count,
+            "ids": [idx + 1 for idx in group],
+            "verbosity": verbosity,
+            "slim_reference": slim_ref,
+            "format": prompt_format,
+            "status": "pending",
+            "fixed": 0,
+            "error": None,
+        }
+        attempts.append(attempt_record)
+
+        started = False
+        try:
+            self._update_translator_prompt(
+                system_prompt, self._format_to_response_format(prompt_format),
+            )
+            # 每次降级重试前清缓存：缓存键只含 user_text 的 hash，不清空会直接
+            # 命中上一轮的同一份坏结果，阶梯等于白跑。
+            clear_cache = getattr(self._translator, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
+            timeout = max(len(user_text) * 3 // 400 + 40, 60)
+            started = True
+            _, parsed, call_record = self._call_ai(
+                stage=stage,
+                system_prompt=system_prompt,
+                user_prompt=user_text,
+                response_format=self._format_to_response_format(prompt_format),
+                timeout=timeout,
+                parser=lambda response: stage_strategy.parse_stage_1_result(
+                    response, prompt_format=prompt_format,
+                ),
+                parse_error_provider=stage_strategy.consume_parse_errors,
+                prompt_format=prompt_format,
+                part=part_idx + 1,
+                attempt=level,
+                metadata={
+                    "retry_level": level_name,
+                    "retry_verbosity": verbosity,
+                    "retry_group": group_idx + 1,
+                    "retry_group_count": group_count,
+                    "target_ids": [idx + 1 for idx in group],
+                    "rendered_length": len(user_text),
                 },
             )
 
-            if not supp_parsed:
-                _logger.info(f"[{self.file_name}] P1-2 补充翻译：解析结果为空，保留 KR 原文")
-                return 0
+            self._harvest_new_terms(stage_strategy, stage=stage, part_idx=part_idx)
 
-            supp_by_id: dict[int, dict] = {}
-            for t in supp_parsed:
-                if isinstance(t, dict):
-                    try:
-                        tid = int(t.get("id", 0))
-                        if tid:
-                            supp_by_id[tid] = t
-                    except (ValueError, TypeError):
-                        continue
+            if not parsed:
+                attempt_record.update({"status": "parse_error", "error": "解析结果为空"})
+                return [], call_record
 
-            fixed = 0
-            confidence_order = {"low": 0, "medium": 1, "high": 2}
-            confidence_threshold = confidence_order.get(self._config.min_confidence, 1)
-            for local_idx, src_idx in enumerate(kr_fallback_indices):
-                expected_id = local_idx + 1
-                st = supp_by_id.get(expected_id)
-                if st is not None and isinstance(st, dict):
-                    trans = st.get("translation", "") or ""
-                    confidence = str(st.get("confidence", "medium")).lower()
-                    source = missing_blocks[local_idx].get("kr", "") if local_idx < len(missing_blocks) else ""
-                    # 韩文原样回填不算修复，否则会把漏翻当成成功结果写进产出
-                    if is_untranslated_hangul(trans, source):
-                        continue
-                    if trans and confidence_order.get(confidence, 1) >= confidence_threshold:
-                        part_result[src_idx] = trans
-                        fixed += 1
-
-            requested = len(kr_fallback_indices)
-            if fixed == requested:
-                _logger.info(
-                    f"[{self.file_name}] P1-2 补充翻译完成: "
-                    f"修复 {fixed}/{requested} 条缺失"
-                )
-            else:
-                self._mark_call_failure(
-                    call_record,
-                    status="fallback",
-                    failure_kind="supplemental_translation_unresolved",
-                    validation_errors=[{
-                        "requested": requested,
-                        "fixed": fixed,
-                    }],
-                )
-                _logger.warning(
-                    f"[{self.file_name}] P1-2 补充翻译：仍有 "
-                    f"{requested - fixed}/{requested} 条未修复，保留 KR 原文"
-                )
-            return fixed
-
-        except Exception as e:
-            if not supp_call_started:
+            recovered = self._apply_retry_payload(
+                parsed, group, text_blocks, part_result,
+            )
+            attempt_record.update({
+                "status": "ok" if recovered else "no_usable_entry",
+                "fixed": len(recovered),
+                "call_id": call_record.get("call_id"),
+            })
+            return recovered, call_record
+        except Exception as exc:  # noqa: BLE001 - 单组失败不应中断阶梯
+            attempt_record.update({"status": "exception", "error": str(exc)[:300]})
+            if not started:
                 self._record_diagnostic_event(
-                    stage="p1_2",
+                    stage=stage,
                     status="internal_error",
                     failure_kind="prompt_or_config_error",
-                    prompt_format=primary_format,
+                    prompt_format=prompt_format,
                     part=part_idx + 1,
-                    exc=e,
+                    exc=exc,
+                    metadata={
+                        "retry_level": level_name,
+                        "target_ids": [idx + 1 for idx in group],
+                    },
                 )
-            _logger.exception(
-                f"[{self.file_name}] P1-2 补充翻译异常 ({e})，保留 KR 原文"
+            _logger.warning(
+                f"[{self.file_name}] 降级重试 {level_name} "
+                f"第 {group_idx + 1}/{group_count} 组异常 ({exc})"
             )
-            return 0
+            return [], None
+
+    def _apply_retry_payload(
+        self,
+        parsed: list,
+        group: list[int],
+        text_blocks: list[dict],
+        part_result: list,
+    ) -> list[int]:
+        """把重试响应按组内序号回填到 ``part_result``，返回被修复的索引。
+
+        只有译文非空、不是韩文原样回填、且置信度达标才算修复——否则会把同一份
+        坏结果当成"救回来了"写进产出。
+        """
+        by_id: dict[int, dict] = {}
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            try:
+                tid = int(item.get("id", 0))
+            except (ValueError, TypeError):
+                continue
+            if tid and tid not in by_id:
+                by_id[tid] = item
+        if not by_id:
+            # 模型未输出 id 时按顺序兜底
+            by_id = {
+                i + 1: item for i, item in enumerate(parsed) if isinstance(item, dict)
+            }
+
+        threshold = _CONFIDENCE_ORDER.get(self._config.min_confidence, 1)
+        recovered: list[int] = []
+        for local_idx, src_idx in enumerate(group):
+            entry = by_id.get(local_idx + 1)
+            if entry is None:
+                continue
+            translation = entry.get("translation", "") or ""
+            if not isinstance(translation, str) or not translation.strip():
+                continue
+            source = text_blocks[src_idx].get("kr", "") if src_idx < len(text_blocks) else ""
+            if is_untranslated_hangul(translation, source):
+                continue
+            confidence = str(entry.get("confidence", "medium")).lower()
+            if _CONFIDENCE_ORDER.get(confidence, 1) < threshold:
+                continue
+            part_result[src_idx] = translation
+            recovered.append(src_idx)
+        return recovered
+
+    # ----- 重试路径的接口兼容层 -----
+
+    @staticmethod
+    def _build_retry_request(builder, blocks: list[dict], *, slim: bool) -> dict:
+        """构造重试子请求，兼容只实现旧接口的 builder。"""
+        build_part = getattr(builder, "build_part_request", None)
+        if callable(build_part):
+            return build_part(blocks, slim=slim)
+        return {"metadata": {}, "reference": {}, "text_blocks": list(blocks)}
+
+    def _build_retry_prompt(
+        self, stage_strategy, *, verbosity: str, prompt_format: str,
+    ) -> str:
+        """构建重试用的 system prompt，兼容不接受 verbosity 的策略实现。"""
+        try:
+            return stage_strategy.build_stage_1_prompt(
+                self.file_type, prompt_format=prompt_format, verbosity=verbosity,
+            )
+        except TypeError:
+            return stage_strategy.build_stage_1_prompt(
+                self.file_type, prompt_format=prompt_format,
+            )
+
+    @staticmethod
+    def _render_retry_prompt(builder, request: dict, prompt_format: str) -> str:
+        """渲染重试请求文本，兼容只提供公开 get_request_text 的 builder。"""
+        render = getattr(builder, "_get_request_text", None)
+        if callable(render):
+            return render(request, prompt_format)
+        texts = builder.get_request_text(prompt_format) or []
+        return texts[0] if texts else ""
+
+    # ========== 新专有名词收集 ==========
+
+    def _harvest_new_terms(
+        self, stage_strategy: "StageStrategy", *, stage: str, part_idx: int,
+    ) -> None:
+        """收集模型回传的新专有名词，必要时热更新术语表。
+
+        这是纯粹的附加产出：任何环节出错都只记 debug 日志，绝不影响翻译主流程。
+        """
+        collector = getattr(self, "_new_term_collector", None)
+        if collector is None:
+            return
+        try:
+            items = stage_strategy.consume_new_terms()
+            if not items:
+                return
+            engine = getattr(self, "_engine", None)
+            known = set(engine.proper_terms) if engine is not None else set()
+            accepted = collector.add(items, source=self.file_name, known_terms=known)
+            if accepted:
+                _logger.debug(
+                    f"[{self.file_name}] 收集到 {accepted} 条新专有名词候选 "
+                    f"(stage={stage}, part={part_idx + 1})"
+                )
+            self._maybe_hot_update_terms()
+        except Exception as exc:  # noqa: BLE001 - 附加产出不影响主流程
+            _logger.debug(f"[{self.file_name}] 新专有名词收集异常 ({exc})")
+
+    def _maybe_hot_update_terms(self) -> None:
+        """把累积到阈值的新词并入匹配引擎，供本轮后续文件使用。"""
+        collector = getattr(self, "_new_term_collector", None)
+        engine = getattr(self, "_engine", None)
+        if collector is None or engine is None:
+            return
+        if not self._config.new_terms_hot_update:
+            return
+        batch = collector.take_hot_update_batch(
+            max(1, int(self._config.new_terms_hot_update_batch))
+        )
+        if not batch:
+            return
+        added = engine.add_proper_terms(batch)
+        if added:
+            _logger.info(
+                f"[{self.file_name}] 术语表热更新: 并入 {added} 条新专有名词"
+                f"（本轮后续文件即可命中）"
+            )
 
     def _build_format_chain(self) -> list[str]:
         """构建格式回退链：[用户选择] + fallback? [xml_json, json_json, xml_xml] : [].
