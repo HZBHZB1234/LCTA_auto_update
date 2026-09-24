@@ -240,18 +240,28 @@ class RequestBuilder:
 
     # ========== 子请求（补充翻译 / 降级重试） ==========
 
-    def build_part_request(self, blocks: list[dict], *, slim: bool = False) -> dict:
+    def build_part_request(
+        self, blocks: list[dict], *, slim: bool = False,
+        include_affects: bool | None = None,
+    ) -> dict:
         """由若干文本块构造子请求。
 
-        补充翻译与降级重试共用同一套构造逻辑，避免两处口径漂移。
+        补充翻译、降级重试与规则违规修复共用同一套构造逻辑，避免口径漂移。
 
         Args:
             blocks: 参与本次子请求的文本块
             slim: True 时只保留这些块实际引用的专有名词，砍掉
                 affects / models / model_docs / skill_doc —— 用于
                 「剥离复杂响应规则」档位，把请求压到最小。
+            include_affects: 是否保留这些块引用的状态效果。None（默认）沿用旧语义
+                —— 由 ``slim`` 决定；显式 True 可在 ``slim=True`` 下单独保留 affects，
+                供规则违规修复使用（effect_ref 需要 id→中文名 映射，但不需要
+                models / model_docs / skill_doc）。
         """
         reference = self.unified_request.get("reference", {}) if self.unified_request else {}
+
+        if include_affects is None:
+            include_affects = not slim
 
         proper_refs: set[str] = set()
         for block in blocks:
@@ -263,15 +273,16 @@ class RequestBuilder:
                 if t.get("term", "") in proper_refs
             ],
         }
-        if not slim:
+        if include_affects:
             affect_refs: set[str] = set()
             for block in blocks:
                 affect_refs.update(block.get("affect_refs", []))
+            part_reference["affects"] = [
+                a for a in reference.get("affects", [])
+                if f'[{a.get("id", "")}]' in affect_refs
+            ]
+        if not slim:
             part_reference.update({
-                "affects": [
-                    a for a in reference.get("affects", [])
-                    if f'[{a.get("id", "")}]' in affect_refs
-                ],
                 "models": reference.get("models", []),
                 "model_docs": reference.get("model_docs", []),
                 "skill_doc": reference.get("skill_doc", ""),
@@ -281,6 +292,8 @@ class RequestBuilder:
         metadata["total_text_blocks"] = len(blocks)
         if slim:
             metadata["slim_reference"] = True
+            if include_affects:
+                metadata["affects_only"] = True
 
         return {
             "metadata": metadata,

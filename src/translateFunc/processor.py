@@ -975,64 +975,25 @@ class FileProcessor:
             result = self._postprocess_richtext(result)
 
             # ====== 规则化后处理校验（技能文件专用） ======
+            # 校验与修复拆成两步：此处只做「检查 + 确定性自动修复」并暂存待修清单，
+            # 真正的发还修复放在阶段 2 之后（_repair_rule_violations）——阶段 2 会
+            # 改写译文，若修复跑在它前面，刚修好的 [EffectID] 有概率被它又改回中文名。
+            rule_validator: RuleBasedValidator | None = None
+            rule_text_blocks: list[dict] = []
+            pending_rule_repair: list[dict] = []
             if self.is_skill and self._config.enable_rule_validation:
                 _logger.debug(f"[{self.file_name}] 规则化后处理校验")
                 try:
                     reference = builder.unified_request.get("reference", {})
                     affects_data = reference.get("affects", [])
                     if affects_data:
-                        validator = RuleBasedValidator(affects_data)
-                        text_blocks_for_check = builder.unified_request.get("text_blocks", [])
-                        report = validator.run_all_checks(text_blocks_for_check, result)
-
-                        error_count = sum(
-                            1 for v in report.violations if v.severity == "error"
+                        rule_validator = RuleBasedValidator(affects_data)
+                        rule_text_blocks = list(
+                            builder.unified_request.get("text_blocks", [])
                         )
-                        warn_count = report.warnings_remaining
-                        if error_count > 0 or warn_count > 0:
-                            _logger.info(
-                                f"[{self.file_name}] 规则校验: {error_count} 个错误, "
-                                f"{warn_count} 个警告"
-                            )
-
-                        # 应用自动修正
-                        if report.auto_fixes_applied > 0:
-                            result = validator.apply_auto_fixes(result, report.violations)
-                            _logger.info(
-                                f"[{self.file_name}] 规则校验自动修正了 "
-                                f"{report.auto_fixes_applied} 处问题"
-                            )
-
-                        # 记录不可自动修正的违规
-                        for v in report.violations:
-                            if not v.auto_fixable:
-                                _logger.warning(
-                                    f"[{self.file_name}] [规则校验警告] "
-                                    f"{v.rule}: {v.message} (block #{v.block_id})"
-                                )
-
-                        violations = [
-                            {
-                                "rule": v.rule,
-                                "severity": v.severity,
-                                "message": v.message,
-                                "block_id": v.block_id,
-                                "auto_fixable": v.auto_fixable,
-                            }
-                            for v in report.violations
-                        ]
-                        unresolved = [v for v in violations if not v["auto_fixable"]]
-                        self._record_diagnostic_event(
-                            stage="rule_validation",
-                            status="validation_error" if unresolved else "success",
-                            failure_kind="rule_validation" if unresolved else None,
-                            prompt_format=user_format,
-                            parsed_response=violations,
-                            validation_errors=unresolved,
-                            metadata={
-                                "auto_fixes_applied": report.auto_fixes_applied,
-                                "warnings_remaining": report.warnings_remaining,
-                            },
+                        result, pending_rule_repair = self._run_rule_check(
+                            result, rule_validator, rule_text_blocks,
+                            prompt_format=user_format, phase="pre_stage_2",
                         )
                 except Exception as e:
                     self._record_diagnostic_event(
@@ -1136,6 +1097,20 @@ class FileProcessor:
                         f"[{self.file_name}] 阶段 2 自校验异常 ({e})，使用未校验的翻译结果"
                     )
 
+            # ====== 规则违规回流修复（阶段 2 之后，修复结果直接落盘） ======
+            # 开关关闭时整块跳过：校验只跑阶段 2 之前那一次，行为与改动前一致。
+            if rule_validator is not None and self._config.enable_rule_repair:
+                # 阶段 2 改写过译文，按当前 result 重算待修清单（纯本地，无 API 调用）
+                result, pending_rule_repair = self._run_rule_check(
+                    result, rule_validator, rule_text_blocks,
+                    prompt_format=user_format, phase="post_stage_2",
+                )
+                if pending_rule_repair:
+                    result = self._repair_rule_violations(
+                        builder, stage_strategy, result, rule_text_blocks,
+                        pending_rule_repair, rule_validator, user_format,
+                    )
+
             return builder.deBuild(result), had_fallback
         else:
             # 非 LLM 路径：不存在格式回退
@@ -1181,6 +1156,456 @@ class FileProcessor:
                 f"[{self.file_name}] 富文本转义后处理异常 ({e})，使用未修正的翻译结果"
             )
         return result
+
+    # ========== 规则违规回流修复 ==========
+
+    # 修复用的提示词档位。**用 slim 而非 minimal**：minimal 档会把 SKILL 的
+    # P0/P1 规则（禁止 [中文名]、Buff 名后带半角空格）一并丢掉，而那正是本次要修的
+    # 两类违规所违反的规则，剥掉等于让模型盲修。slim 只去 P2 风格规则与 few-shot，
+    # 保留 P0/P1，请求体量仍然很小（只带违规块）。
+    _REPAIR_VERBOSITY = "slim"
+
+    def _run_rule_check(
+        self,
+        result: list,
+        validator: "RuleBasedValidator",
+        text_blocks: list[dict],
+        *,
+        prompt_format: str,
+        phase: str,
+    ) -> tuple[list, list[dict]]:
+        """跑一遍确定性规则校验：应用自动修复并记录诊断事件。
+
+        纯本地计算，不产生 API 调用。阶段 2 前后各跑一次 —— 阶段 2 会改写译文，
+        可能修好一些不合规、也可能引入新的，所以修复前必须按**当前** result 重算
+        待修清单，沿用阶段 2 之前的旧清单会漏掉新引入的违规。
+
+        Returns:
+            ``(修正后的译文列表, 待修清单)``，待修清单只含 auto_fixable=False 的违规。
+        """
+        report = validator.run_all_checks(text_blocks, result)
+
+        error_count = sum(
+            1 for v in report.violations if v.severity == "error"
+        )
+        warn_count = report.warnings_remaining
+        if error_count > 0 or warn_count > 0:
+            _logger.info(
+                f"[{self.file_name}] 规则校验({phase}): {error_count} 个错误, "
+                f"{warn_count} 个警告"
+            )
+
+        # 应用自动修正（确定性规则，无需模型参与）
+        if report.auto_fixes_applied > 0:
+            result = validator.apply_auto_fixes(result, report.violations)
+            _logger.info(
+                f"[{self.file_name}] 规则校验({phase})自动修正了 "
+                f"{report.auto_fixes_applied} 处问题"
+            )
+
+        violations = [
+            {
+                "rule": v.rule,
+                "severity": v.severity,
+                "message": v.message,
+                "block_id": v.block_id,
+                "auto_fixable": v.auto_fixable,
+            }
+            for v in report.violations
+        ]
+        pending = [v for v in violations if not v["auto_fixable"]]
+        for v in pending:
+            _logger.warning(
+                f"[{self.file_name}] [规则校验警告] {v['rule']}: {v['message']} "
+                f"(block #{v['block_id']})"
+            )
+
+        self._record_diagnostic_event(
+            stage="rule_validation",
+            status="validation_error" if pending else "success",
+            failure_kind="rule_validation" if pending else None,
+            prompt_format=prompt_format,
+            parsed_response=violations,
+            validation_errors=pending,
+            metadata={
+                "phase": phase,
+                "auto_fixes_applied": report.auto_fixes_applied,
+                "warnings_remaining": report.warnings_remaining,
+                "repairable": len(pending),
+                "repair_enabled": bool(self._config.enable_rule_repair),
+            },
+        )
+        return result, pending
+
+    def _repair_rule_violations(
+        self,
+        builder: "RequestBuilder",
+        stage_strategy: "StageStrategy",
+        result: list,
+        text_blocks: list[dict],
+        pending: list[dict],
+        validator: "RuleBasedValidator",
+        prompt_format: str,
+    ) -> list:
+        """对规则校验判定不合规的条目构造最小请求发还，尝试修复。
+
+        只处理 ``auto_fixable=False`` 的违规（effect_ref / 未知 [中文名]）——
+        确定性可修的违规在校验阶段已由 ``apply_auto_fixes`` 修好，没必要花调用。
+
+        请求被压到最小：只带违规块、slim reference（只留块直接引用的 proper_terms
+        与 affects，砍掉 models / model_docs / skill_doc）+ slim 提示词，并在 user
+        prompt 末尾追加 ``<violation_report>`` 说明每块错在哪、该怎么改。
+
+        回填前**必须复验**：对候选译文重跑同一校验器的对应规则，违规真的消失才覆盖
+        ``result``；否则保留原译文。``_apply_retry_payload`` 只看非空/非韩文/置信度，
+        不看规则是否修好，单靠它会把「换了个错法」当成救回来了。
+
+        任何异常都只记录诊断事件并保留原译文，绝不阻断发布。
+
+        Returns:
+            修正后的译文列表（原地修改 ``result`` 并返回同一对象）。
+        """
+        if not self._config.enable_rule_repair:
+            return result
+
+        budget = max(0, int(self._config.rule_repair_max_calls))
+        if budget <= 0:
+            return result
+
+        # 按块归并：{全局块索引(0-based): [违规, ...]}
+        # 上界同时受 result 约束：极端情况下 result 可能短于 text_blocks
+        # （某个 part 的 part_data 为 None 被跳过），越界索引一律丢弃。
+        limit = min(len(text_blocks), len(result))
+        by_block: dict[int, list[dict]] = {}
+        for v in pending:
+            try:
+                block_id = int(v.get("block_id", 0))
+            except (ValueError, TypeError):
+                continue
+            if 1 <= block_id <= limit:
+                by_block.setdefault(block_id - 1, []).append(v)
+        if not by_block:
+            return result
+
+        targets = sorted(by_block)
+        chunk = max(1, int(self._config.retry_chunk_size))
+        groups = _chunk_evenly(
+            targets, max(1, (len(targets) + chunk - 1) // chunk),
+        )
+
+        _logger.info(
+            f"[{self.file_name}] 规则违规回流修复: {len(targets)} 个不合规块 "
+            f"(预算 {budget} 次调用) | 规则: {self._summarize_rules(pending)}"
+        )
+
+        attempts: list[dict] = []
+        fixed: list[int] = []
+        used = 0
+        for group_idx, group in enumerate(groups):
+            if used >= budget:
+                break
+            used += 1
+            repaired, record = self._repair_group(
+                builder, stage_strategy, result, text_blocks, group,
+                by_block=by_block, validator=validator,
+                prompt_format=prompt_format,
+                group_idx=group_idx, group_count=len(groups),
+            )
+            attempts.append(record)
+            for idx in repaired:
+                if idx not in fixed:
+                    fixed.append(idx)
+
+        remaining = [idx for idx in targets if idx not in fixed]
+        self._record_diagnostic_event(
+            stage="rule_repair",
+            status="success" if not remaining else "partial",
+            failure_kind=None if not remaining else "rule_repair_incomplete",
+            prompt_format=prompt_format,
+            validation_errors=[
+                {
+                    "block_id": idx + 1,
+                    "rules": sorted({
+                        str(v.get("rule", "")) for v in by_block[idx]
+                    }),
+                    "action": "keep_original_translation",
+                }
+                for idx in remaining
+            ],
+            metadata={
+                "repairable": len(targets),
+                "repaired": len(fixed),
+                "budget": budget,
+                "used": used,
+                "by_rule": self._summarize_rules(pending),
+                "attempts": attempts,
+            },
+        )
+        if remaining:
+            _logger.warning(
+                f"[{self.file_name}] 规则违规回流修复未全部修好: "
+                f"已修 {len(fixed)}/{len(targets)}，剩余 "
+                f"{[idx + 1 for idx in remaining][:10]}... 保留原译文"
+            )
+        else:
+            _logger.info(
+                f"[{self.file_name}] 规则违规回流修复成功: {len(fixed)} 个块"
+                f"已修正并复验通过（{used} 次调用）"
+            )
+        return result
+
+    def _repair_group(
+        self,
+        builder: "RequestBuilder",
+        stage_strategy: "StageStrategy",
+        result: list,
+        text_blocks: list[dict],
+        group: list[int],
+        *,
+        by_block: dict[int, list[dict]],
+        validator: "RuleBasedValidator",
+        prompt_format: str,
+        group_idx: int,
+        group_count: int,
+    ) -> tuple[list[int], dict]:
+        """对一组违规块发一次修复请求，返回 ``(被修好的索引, 尝试记录)``。"""
+        blocks = [text_blocks[idx] for idx in group]
+        # 最小请求：slim reference + 单独保留 affects（effect_ref 需要 id→中文名映射）
+        request = self._build_retry_request(
+            builder, blocks, slim=True, include_affects=True,
+        )
+        system_prompt = self._build_retry_prompt(
+            stage_strategy, verbosity=self._REPAIR_VERBOSITY,
+            prompt_format=prompt_format,
+        )
+        hint = self._build_repair_hint(group, by_block)
+        user_text = self._render_retry_prompt(
+            builder, request, prompt_format, repair_hint=hint,
+        )
+
+        record: dict = {
+            "group": group_idx + 1,
+            "group_count": group_count,
+            "ids": [idx + 1 for idx in group],
+            "rules": sorted({
+                str(v.get("rule", ""))
+                for idx in group for v in by_block.get(idx, [])
+            }),
+            "text_blocks": len(blocks),
+            "rendered_length": len(user_text),
+            "status": "pending",
+            "fixed": [],
+            "error": None,
+        }
+
+        started = False
+        try:
+            self._update_translator_prompt(
+                system_prompt, self._format_to_response_format(prompt_format),
+            )
+            # 与降级重试同理：缓存键只含 user_text hash，不清空会命中旧结果
+            clear_cache = getattr(self._translator, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
+            timeout = max(len(user_text) * 3 // 400 + 40, 60)
+            started = True
+            _, parsed, call_record = self._call_ai(
+                stage="rule_repair",
+                system_prompt=system_prompt,
+                user_prompt=user_text,
+                response_format=self._format_to_response_format(prompt_format),
+                timeout=timeout,
+                parser=lambda response: stage_strategy.parse_stage_1_result(
+                    response, prompt_format=prompt_format,
+                ),
+                parse_error_provider=stage_strategy.consume_parse_errors,
+                prompt_format=prompt_format,
+                part=group_idx + 1,
+                attempt=1,
+                metadata={
+                    "rule_repair_group": group_idx + 1,
+                    "rule_repair_group_count": group_count,
+                    "target_ids": [idx + 1 for idx in group],
+                    "rules": record["rules"],
+                    "rendered_length": len(user_text),
+                },
+            )
+
+            self._harvest_new_terms(
+                stage_strategy, stage="rule_repair", part_idx=group_idx,
+            )
+
+            if not parsed:
+                record.update({"status": "parse_error", "error": "解析结果为空"})
+                return [], record
+
+            repaired = self._apply_repair_payload(
+                parsed, group, text_blocks, result, by_block, validator,
+            )
+            record.update({
+                "status": "ok" if len(repaired) == len(group) else (
+                    "partial" if repaired else "no_usable_entry"
+                ),
+                "fixed": [idx + 1 for idx in repaired],
+                "call_id": call_record.get("call_id"),
+            })
+            if repaired and len(repaired) == len(group):
+                self._mark_call_recovered(call_record, recovery_kind="rule_repair")
+            return repaired, record
+        except Exception as exc:  # noqa: BLE001 - 单组失败不应中断修复
+            record.update({"status": "exception", "error": str(exc)[:300]})
+            if not started:
+                self._record_diagnostic_event(
+                    stage="rule_repair",
+                    status="internal_error",
+                    failure_kind="prompt_or_config_error",
+                    prompt_format=prompt_format,
+                    part=group_idx + 1,
+                    exc=exc,
+                    metadata={"target_ids": [idx + 1 for idx in group]},
+                )
+            _logger.warning(
+                f"[{self.file_name}] 规则违规回流修复 第 "
+                f"{group_idx + 1}/{group_count} 组异常 ({exc})，保留原译文"
+            )
+            return [], record
+
+    def _apply_repair_payload(
+        self,
+        parsed: list,
+        group: list[int],
+        text_blocks: list[dict],
+        result: list,
+        by_block: dict[int, list[dict]],
+        validator: "RuleBasedValidator",
+    ) -> list[int]:
+        """把修复响应回填到 ``result``，返回真正修好的索引。
+
+        采纳条件（缺一不可）：
+        1. 译文非空；
+        2. 不是韩文原样回填；
+        3. 置信度达标（模型未给 confidence 时按 medium 计）；
+        4. **复验通过** —— 原先不合规的规则在该块上不再报违规。
+        """
+        by_id: dict[int, dict] = {}
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            try:
+                tid = int(item.get("id", 0))
+            except (ValueError, TypeError):
+                continue
+            if tid and tid not in by_id:
+                by_id[tid] = item
+        if not by_id:
+            # 模型未输出 id 时按顺序兜底
+            by_id = {
+                i + 1: item for i, item in enumerate(parsed) if isinstance(item, dict)
+            }
+
+        threshold = _CONFIDENCE_ORDER.get(self._config.min_confidence, 1)
+        repaired: list[int] = []
+        for local_idx, src_idx in enumerate(group):
+            entry = by_id.get(local_idx + 1)
+            if entry is None:
+                continue
+            translation = entry.get("translation", "") or ""
+            if not isinstance(translation, str) or not translation.strip():
+                continue
+            source = text_blocks[src_idx].get("kr", "") if src_idx < len(text_blocks) else ""
+            if is_untranslated_hangul(translation, source):
+                continue
+            confidence = str(entry.get("confidence", "medium")).lower()
+            if _CONFIDENCE_ORDER.get(confidence, 1) < threshold:
+                continue
+            rules = {str(v.get("rule", "")) for v in by_block.get(src_idx, [])}
+            accepted = self._revalidate_candidate(
+                validator, text_blocks[src_idx], translation, rules,
+            )
+            if accepted is None:
+                continue
+            result[src_idx] = accepted
+            repaired.append(src_idx)
+        return repaired
+
+    def _revalidate_candidate(
+        self,
+        validator: "RuleBasedValidator",
+        block: dict,
+        candidate: str,
+        rules: set[str],
+    ) -> str | None:
+        """复验候选译文：原先不合规的规则不再报违规才采纳。
+
+        先把候选过一遍确定性自动修复（Buff 名空格 / 已知 [中文名] / 富文本转义），
+        再检查 ``rules`` 里的规则是否仍报违规——模型修对主要问题的同时引入一个
+        确定性可修的小毛病，不该因此被整体否掉。
+
+        Returns:
+            可采纳的最终文本；仍不合规或复验自身异常时返回 None（一律不采纳）。
+        """
+        try:
+            text = candidate
+            checks = validator.run_all_checks([block], [text])
+            fixable = [
+                v for v in list(checks.violations)
+                + list(validator.validate_richtext_escapes([text]))
+                if v.auto_fixable and v.fix_fn
+            ]
+            if fixable:
+                text = RuleBasedValidator.apply_auto_fixes([text], fixable)[0]
+            remaining = [
+                v for v in validator.run_all_checks([block], [text]).violations
+                if v.rule in rules
+            ]
+            if remaining:
+                return None
+            return text
+        except Exception as exc:  # noqa: BLE001 - 复验异常一律不采纳
+            _logger.debug(
+                f"[{self.file_name}] 规则修复复验异常 ({exc})，不采纳该候选译文"
+            )
+            return None
+
+    def _build_repair_hint(
+        self, group: list[int], by_block: dict[int, list[dict]],
+    ) -> str:
+        """构造 ``<violation_report>`` 段：逐块说明违规原因与修正要求。
+
+        块 id 用**组内序号**（1-based），与本次子请求里 text_blocks 的编号一致
+        ——子请求渲染时会重新从 1 编号，用全局 id 会指错块。
+        """
+        lines = [
+            "<violation_report>",
+            "以下条目的译文经规则校验判定不合规，请只修正这些条目的译文，"
+            "其余条目的译文保持不变：",
+        ]
+        for local_idx, src_idx in enumerate(group):
+            for v in by_block.get(src_idx, []):
+                lines.append(
+                    f"block {local_idx + 1}: [{v.get('rule', '')}] "
+                    f"{v.get('message', '')}"
+                )
+        lines.append("修正要求：")
+        lines.append(
+            "- 方括号 [] 内只能是英文引擎标识符（如 [Combustion]、"
+            "[OnSucceedAttack]），严禁输出 [中文名] 形式。"
+        )
+        lines.append(
+            "- 正文中的状态效果使用术语表给出的中文名称，名称后跟一个半角空格"
+            "（如「燃烧 」），不要保留状态效果的英文 ID。"
+        )
+        lines.append("</violation_report>")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _summarize_rules(pending: list[dict]) -> str:
+        """把待修违规按规则名汇总成 ``rule=count``，便于日志与 dump 统计。"""
+        counts: dict[str, int] = {}
+        for v in pending:
+            rule = str(v.get("rule", "unknown"))
+            counts[rule] = counts.get(rule, 0) + 1
+        return ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
 
     # ========== 失败降级阶梯 ==========
 
@@ -1546,10 +1971,24 @@ class FileProcessor:
     # ----- 重试路径的接口兼容层 -----
 
     @staticmethod
-    def _build_retry_request(builder, blocks: list[dict], *, slim: bool) -> dict:
-        """构造重试子请求，兼容只实现旧接口的 builder。"""
+    def _build_retry_request(
+        builder, blocks: list[dict], *, slim: bool,
+        include_affects: bool | None = None,
+    ) -> dict:
+        """构造重试子请求，兼容只实现旧接口的 builder。
+
+        ``include_affects`` 仅在规则违规修复时显式传入（None = 沿用 ``slim`` 语义）；
+        旧 builder 不接受该参数时回退到旧调用，行为与改动前一致。
+        """
         build_part = getattr(builder, "build_part_request", None)
         if callable(build_part):
+            if include_affects is not None:
+                try:
+                    return build_part(
+                        blocks, slim=slim, include_affects=include_affects,
+                    )
+                except TypeError:
+                    pass
             return build_part(blocks, slim=slim)
         return {"metadata": {}, "reference": {}, "text_blocks": list(blocks)}
 
@@ -1567,13 +2006,23 @@ class FileProcessor:
             )
 
     @staticmethod
-    def _render_retry_prompt(builder, request: dict, prompt_format: str) -> str:
-        """渲染重试请求文本，兼容只提供公开 get_request_text 的 builder。"""
+    def _render_retry_prompt(
+        builder, request: dict, prompt_format: str, repair_hint: str = "",
+    ) -> str:
+        """渲染重试请求文本，兼容只提供公开 get_request_text 的 builder。
+
+        ``repair_hint`` 非空时追加到渲染结果末尾（规则违规修复用）。缺省为空串，
+        渲染结果与改动前逐字节一致。
+        """
         render = getattr(builder, "_get_request_text", None)
         if callable(render):
-            return render(request, prompt_format)
-        texts = builder.get_request_text(prompt_format) or []
-        return texts[0] if texts else ""
+            text = render(request, prompt_format)
+        else:
+            texts = builder.get_request_text(prompt_format) or []
+            text = texts[0] if texts else ""
+        if repair_hint:
+            text = f"{text}\n{repair_hint}" if text else repair_hint
+        return text
 
     # ========== 新专有名词收集 ==========
 

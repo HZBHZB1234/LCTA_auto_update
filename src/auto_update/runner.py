@@ -260,6 +260,8 @@ def _run_translation(
         translation_mode=config.translation.translation_mode,
         enable_self_check=config.features.enable_self_check,
         enable_rule_validation=config.features.enable_rule_validation,
+        enable_rule_repair=config.features.enable_rule_repair,
+        rule_repair_max_calls=config.features.rule_repair_max_calls,
         disambiguation_mode=config.translation.disambiguation_mode,
         min_confidence=config.translation.min_confidence,
         prompt_format=config.translation.prompt_format,

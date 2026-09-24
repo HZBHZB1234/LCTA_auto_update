@@ -109,6 +109,12 @@ features:
   # 启用规则验证
   enable_rule_validation: true
 
+  # 规则校验判定不合规的条目：构造最小请求发还给模型尝试修复（默认关）
+  enable_rule_repair: false
+
+  # 单个文件的规则修复调用预算（与分片降级阶梯预算分开计数）
+  rule_repair_max_calls: 2
+
   # 启用思维链推理（仅部分模型支持）
   enable_thinking: false
 

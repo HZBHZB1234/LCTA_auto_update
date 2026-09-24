@@ -58,6 +58,8 @@ class FeatureConfig:
     enable_concurrent: bool
     enable_self_check: bool
     enable_rule_validation: bool
+    enable_rule_repair: bool
+    rule_repair_max_calls: int
     enable_thinking: bool
     fallback: bool
     debug_mode: bool
@@ -180,6 +182,10 @@ class AppConfig:
                 enable_concurrent=_boolean(features, "enable_concurrent"),
                 enable_self_check=_boolean(features, "enable_self_check"),
                 enable_rule_validation=_boolean(features, "enable_rule_validation"),
+                enable_rule_repair=_boolean(features, "enable_rule_repair"),
+                rule_repair_max_calls=_integer(
+                    features, "rule_repair_max_calls", minimum=0, maximum=16,
+                ),
                 enable_thinking=_boolean(features, "enable_thinking"),
                 fallback=_boolean(features, "fallback"),
                 debug_mode=_boolean(features, "debug_mode"),

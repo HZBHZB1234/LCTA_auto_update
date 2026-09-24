@@ -48,6 +48,12 @@ class TranslateConfig:
     retry_max_calls_per_part: int = 4  # 单个 part 的阶梯调用硬预算
     retry_split_depth: int = 1        # L1 内二分递归层数（保守预算下默认只切一刀）
 
+    # --- 规则违规回流修复（规则校验判定不合规的条目，构造最小请求发还给模型重译）---
+    # 只针对不可自动修复的违规（effect_ref / 未知 [中文名]），三类确定性可修的
+    # 违规（buff_spacing / 已知 [中文名] / richtext_escape）不走此路径。
+    enable_rule_repair: bool = False   # 默认关，需要时手动开
+    rule_repair_max_calls: int = 2     # 单个文件的修复调用硬预算（与 part 阶梯预算分开计数）
+
     # --- 新专有名词的发现与回流（模型在响应中回报名词，下次输入时并入术语表）---
     enable_new_terms: bool = True
     new_terms_path: str = ""          # 空 = <output_dir>/proper_learned.json
@@ -119,6 +125,8 @@ class TranslateConfig:
             retry_chunk_size=configs.get("retry_chunk_size", 8),
             retry_max_calls_per_part=configs.get("retry_max_calls_per_part", 4),
             retry_split_depth=configs.get("retry_split_depth", 1),
+            enable_rule_repair=configs.get("enable_rule_repair", False),
+            rule_repair_max_calls=configs.get("rule_repair_max_calls", 2),
             enable_new_terms=configs.get("enable_new_terms", True),
             new_terms_path=configs.get("new_terms_path", ""),
             new_terms_min_votes=configs.get("new_terms_min_votes", 1),
