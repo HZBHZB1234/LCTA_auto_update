@@ -92,7 +92,7 @@ features:
   enable_proper: true
 
   # 自动从远程获取最新专有名词词典
-  auto_fetch_proper: true
+  auto_fetch_proper: false
 
   # 启用角色名翻译
   enable_role: true
