@@ -89,7 +89,7 @@ features:
   deduplicate: true
 
   # 启用专有名词翻译
-  enable_proper: true
+  enable_proper: false
 
   # 自动从远程获取最新专有名词词典
   auto_fetch_proper: false
