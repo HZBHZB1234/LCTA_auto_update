@@ -89,10 +89,10 @@ features:
   deduplicate: true
 
   # 启用专有名词翻译
-  enable_proper: false
+  enable_proper: true
 
   # 自动从远程获取最新专有名词词典
-  auto_fetch_proper: false
+  auto_fetch_proper: true
 
   # 启用角色名翻译
   enable_role: true
