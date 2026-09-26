@@ -276,6 +276,13 @@ def _run_translation(
         jp_path=str(raw_paths["jp"]),
         en_path=str(raw_paths["en"]),
         llc_path=str(cooked_root / "LLC_zh-CN"),
+        jev_enabled=config.translation.jev_enabled,
+        jev_api_key_env=config.translation.jev_api_key_env,
+        jev_base_url=config.translation.jev_base_url,
+        jev_model=config.translation.jev_model,
+        jev_timeout=config.translation.jev_timeout,
+        jev_min_confidence=config.translation.jev_min_confidence,
+        jev_verify=config.translation.jev_verify,
     )
     pipeline = TranslationPipeline(translate_config)
     pipeline.set_callbacks(on_log=_logger.info)

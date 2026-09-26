@@ -582,79 +582,96 @@ class FileProcessor:
                 _logger.debug(f"[{self.file_name}] 阶段 0: 术语消歧 (mode={self._config.disambiguation_mode})")
                 ambiguous_terms = self._collect_ambiguous_terms(builder)
                 if ambiguous_terms:
-                    try:
-                        s0_system = stage_strategy.build_stage_0_prompt(prompt_format=user_format)
-                        self._update_translator_prompt(s0_system, self._format_to_response_format(user_format))
-                        stage_0_parts = stage_strategy.split_stage_0_inputs(
-                            ambiguous_terms,
-                            builder.unified_request.get("text_blocks", []),
-                            prompt_format=user_format,
-                            max_length=builder.max_length,
-                        )
-                        for part_idx, stage_0_part in enumerate(stage_0_parts):
-                            s0_call_started = False
-                            try:
-                                s0_user = stage_strategy.build_stage_0_user_prompt(
-                                    stage_0_part["candidate_terms"],
-                                    stage_0_part["text_blocks"],
-                                    prompt_format=user_format,
+                    # Jev 逐位置消歧（可选）：失败时回退到 LLM 消歧路径
+                    jev_ok = False
+                    if self._config.jev_enabled:
+                        try:
+                            jev_ok = self._try_jev_disambiguation(builder, ambiguous_terms)
+                            if jev_ok:
+                                _logger.info(
+                                    f"[{self.file_name}] 阶段 0: Jev 逐位置消歧完成"
+                                    f"（{len(ambiguous_terms)} 个术语）"
                                 )
-                                s0_call_started = True
-                                _, disambiguated, _ = self._call_ai(
-                                    stage="stage_0",
-                                    system_prompt=s0_system,
-                                    user_prompt=s0_user,
-                                    response_format=self._format_to_response_format(user_format),
-                                    timeout=60,
-                                    parser=lambda response: stage_strategy.parse_stage_0_result(
-                                        response, prompt_format=user_format,
-                                    ),
-                                    parse_error_provider=stage_strategy.consume_parse_errors,
-                                    prompt_format=user_format,
-                                    part=part_idx + 1,
-                                    attempt=1,
-                                    metadata={
-                                        "total_parts": len(stage_0_parts),
-                                        "candidate_terms": len(stage_0_part["candidate_terms"]),
-                                    },
-                                )
-                                if disambiguated:
-                                    _logger.debug(
-                                        f"[{self.file_name}] 阶段 0 消歧 "
-                                        f"{part_idx + 1}/{len(stage_0_parts)}："
-                                        f"{len(disambiguated)} 个术语被评估"
+                                builder._split_by_length(prompt_format=user_format)
+                        except Exception as e:
+                            _logger.exception(
+                                f"[{self.file_name}] 阶段 0 Jev 消歧异常 ({e})，回退 LLM 消歧"
+                            )
+                            jev_ok = False
+                    if not jev_ok:
+                        try:
+                            s0_system = stage_strategy.build_stage_0_prompt(prompt_format=user_format)
+                            self._update_translator_prompt(s0_system, self._format_to_response_format(user_format))
+                            stage_0_parts = stage_strategy.split_stage_0_inputs(
+                                ambiguous_terms,
+                                builder.unified_request.get("text_blocks", []),
+                                prompt_format=user_format,
+                                max_length=builder.max_length,
+                            )
+                            for part_idx, stage_0_part in enumerate(stage_0_parts):
+                                s0_call_started = False
+                                try:
+                                    s0_user = stage_strategy.build_stage_0_user_prompt(
+                                        stage_0_part["candidate_terms"],
+                                        stage_0_part["text_blocks"],
+                                        prompt_format=user_format,
                                     )
-                                    self._apply_disambiguation(builder, disambiguated)
-                                else:
-                                    _logger.debug(
-                                        f"[{self.file_name}] 阶段 0 消歧 "
-                                        f"{part_idx + 1}/{len(stage_0_parts)}：解析结果为空"
-                                    )
-                            except Exception as e:
-                                if not s0_call_started:
-                                    self._record_diagnostic_event(
+                                    s0_call_started = True
+                                    _, disambiguated, _ = self._call_ai(
                                         stage="stage_0",
-                                        status="internal_error",
-                                        failure_kind="prompt_or_config_error",
+                                        system_prompt=s0_system,
+                                        user_prompt=s0_user,
+                                        response_format=self._format_to_response_format(user_format),
+                                        timeout=60,
+                                        parser=lambda response: stage_strategy.parse_stage_0_result(
+                                            response, prompt_format=user_format,
+                                        ),
+                                        parse_error_provider=stage_strategy.consume_parse_errors,
                                         prompt_format=user_format,
                                         part=part_idx + 1,
-                                        exc=e,
-                                        metadata={"total_parts": len(stage_0_parts)},
+                                        attempt=1,
+                                        metadata={
+                                            "total_parts": len(stage_0_parts),
+                                            "candidate_terms": len(stage_0_part["candidate_terms"]),
+                                        },
                                     )
-                                _logger.exception(
-                                    f"[{self.file_name}] 阶段 0 消歧 "
-                                    f"{part_idx + 1}/{len(stage_0_parts)} 异常 ({e})，跳过该分片"
-                                )
-                        builder._split_by_length(prompt_format=user_format)
-                    except Exception as e:
-                        self._record_diagnostic_event(
-                            stage="stage_0",
-                            status="internal_error",
-                            failure_kind="prompt_or_config_error",
-                            prompt_format=user_format,
-                            exc=e,
-                        )
-                        _logger.exception(f"[{self.file_name}] 阶段 0 消歧异常 ({e})，使用原始术语表继续")
+                                    if disambiguated:
+                                        _logger.debug(
+                                            f"[{self.file_name}] 阶段 0 消歧 "
+                                            f"{part_idx + 1}/{len(stage_0_parts)}："
+                                            f"{len(disambiguated)} 个术语被评估"
+                                        )
+                                        self._apply_disambiguation(builder, disambiguated)
+                                    else:
+                                        _logger.debug(
+                                            f"[{self.file_name}] 阶段 0 消歧 "
+                                            f"{part_idx + 1}/{len(stage_0_parts)}：解析结果为空"
+                                        )
+                                except Exception as e:
+                                    if not s0_call_started:
+                                        self._record_diagnostic_event(
+                                            stage="stage_0",
+                                            status="internal_error",
+                                            failure_kind="prompt_or_config_error",
+                                            prompt_format=user_format,
+                                            part=part_idx + 1,
+                                            exc=e,
+                                            metadata={"total_parts": len(stage_0_parts)},
+                                        )
+                                    _logger.exception(
+                                        f"[{self.file_name}] 阶段 0 消歧 "
+                                        f"{part_idx + 1}/{len(stage_0_parts)} 异常 ({e})，跳过该分片"
+                                    )
+                            builder._split_by_length(prompt_format=user_format)
+                        except Exception as e:
+                            self._record_diagnostic_event(
+                                stage="stage_0",
+                                status="internal_error",
+                                failure_kind="prompt_or_config_error",
+                                prompt_format=user_format,
+                                exc=e,
+                            )
+                            _logger.exception(f"[{self.file_name}] 阶段 0 消歧异常 ({e})，使用原始术语表继续")
 
             # 确定格式回退链
             formats_chain = self._build_format_chain()
@@ -2197,6 +2214,193 @@ class FileProcessor:
             f"[{self.file_name}] 阶段 0 消歧：排除了 {len(excluded_terms)} 个不适用的术语: "
             f"{', '.join(sorted(excluded_terms))}"
         )
+
+    def _try_jev_disambiguation(
+        self, builder: "RequestBuilder", ambiguous_terms: list[dict]
+    ) -> bool:
+        """用 Jev System One 逐位置判断每个 (text_block, term) 的适用性。
+
+        与 ``_apply_disambiguation``（整词从全部块移除）不同，Jev 路径把决策
+        绑定到具体出现位置：只从判为 not_applicable 的那个块移除引用，
+        其他块中的同术语保留 —— 修复"整词移除"无法表达逐处含义的问题。
+
+        Returns:
+            True = Jev 消歧已成功应用（即使 0 个排除）；
+            False = Jev 未启用/无 key/请求失败/无答案 → 调用方回退 LLM 消歧。
+        """
+        if not self._config.jev_enabled:
+            return False
+        import os
+        from translateFunc.proper.jev import JevClient
+
+        api_key = os.getenv(self._config.jev_api_key_env, "")
+        if not api_key:
+            _logger.warning(
+                f"[{self.file_name}] Jev 消歧跳过：环境变量 "
+                f"{self._config.jev_api_key_env} 未设置"
+            )
+            return False
+
+        client = JevClient(
+            api_key,
+            base_url=self._config.jev_base_url or JevClient.DEFAULT_BASE_URL,
+            model=self._config.jev_model or JevClient.DEFAULT_MODEL,
+            timeout=self._config.jev_timeout,
+            verify=self._config.jev_verify,
+        )
+
+        text_blocks = builder.unified_request.get("text_blocks", [])
+        if not text_blocks:
+            return False
+
+        # 1. 对每个出现位置构造 occurrence：(term, block_index, cn, candidates)
+        term_by_ref = {
+            t.get("term", ""): t
+            for t in builder.unified_request.get("reference", {}).get("proper_terms", [])
+        }
+        occurrences: list[dict] = []
+        seen: set[tuple[int, str]] = set()
+        for term_item in ambiguous_terms:
+            term = term_item.get("kr", "")
+            cn = term_item.get("cn", "") or term_by_ref.get(term, {}).get("translation", "")
+            note = term_item.get("note", "") or term_by_ref.get(term, {}).get("note", "")
+            for block_idx in term_item.get("text_block_indices", []):
+                key = (block_idx, term)
+                if key in seen:
+                    continue
+                seen.add(key)
+                block = text_blocks[block_idx]
+                occurrences.append({
+                    "term": term,
+                    "cn": cn,
+                    "note": note,
+                    "block_index": block_idx,
+                    "block": block,
+                })
+
+        if not occurrences:
+            return False
+
+        # 2. 构造 Jev state（仅含待判断的块，去重）与问题集
+        needed_indices = sorted({occ["block_index"] for occ in occurrences})
+        state = JevClient.build_block_state([text_blocks[i] for i in needed_indices])
+        index_map = {real_idx: local_idx for local_idx, real_idx in enumerate(needed_indices)}
+        for occ in occurrences:
+            occ["_local_index"] = index_map[occ["block_index"]]
+
+        occurrences_by_qid: dict[str, dict] = {}
+        questions: dict[str, dict] = {}
+        for i, occ in enumerate(occurrences):
+            qid = f"q{i}"
+            block_kr = occ["block"].get("kr", "")
+            local = occ["_local_index"]
+            occ_ref = f"`blocks[{local}].kr`"
+            criteria = {
+                "applicable": (
+                    f"该术语在此处适用，应套用词表译名「{occ['cn']}」"
+                ),
+                "not_applicable": (
+                    "该术语在此处不适用（此处不是该术语的含义/是普通词/误匹配）"
+                ),
+            }
+            if occ["note"]:
+                criteria["applicable"] += f"（词表注记：{occ['note'][:80]}）"
+            questions[qid] = JevClient.choice_question(
+                (
+                    f"判断韩文片段 {occ_ref} 中出现的术语 `{occ['term']}` 是否按词表"
+                    f"译名「{occ['cn']}」使用。只考虑这一处出现位置，不考虑其他句子。"
+                ),
+                criteria,
+            )
+            occurrences_by_qid[qid] = occ
+
+        answers = client.evaluate(state, questions)
+        if not answers:
+            _logger.warning(
+                f"[{self.file_name}] Jev 消歧未返回答案，回退 LLM 消歧"
+            )
+            return False
+
+        decisions = JevClient.answers_to_occurrences(
+            occurrences_by_qid,
+            answers,
+            min_confidence=self._config.jev_min_confidence,
+        )
+        # 只有「明确判定不适用」的位置才移除；applicable/低置信度(None) 一律保留
+        excluded = {
+            (block_idx, term): chosen
+            for (block_idx, term), chosen in decisions.items()
+            if chosen == "not_applicable"
+        }
+        self._apply_jev_disambiguation(builder, excluded)
+        _logger.debug(
+            f"[{self.file_name}] Jev 逐位置消歧：评估 {len(decisions)} 处，"
+            f"{len(excluded)} 处指定不适用"
+        )
+        self._record_diagnostic_event(
+            stage="stage_0",
+            status="success",
+            failure_kind=None,
+            prompt_format=self._config.prompt_format,
+            parsed_response={
+                "engine": "jev",
+                "occurrences": len(occurrences),
+                "decisions": {
+                    f"{bi}:{term}": chosen
+                    for (bi, term), chosen in decisions.items()
+                },
+                "excluded": {f"{bi}:{term}" for (bi, term) in excluded},
+            },
+            metadata={"jev": True},
+        )
+        return True
+
+    def _apply_jev_disambiguation(
+        self,
+        builder: "RequestBuilder",
+        excluded: dict[tuple[int, str], str],
+    ) -> int:
+        """按出现位置应用 Jev 消歧结果：只移除该块中不适用术语的引用。
+
+        Args:
+            builder: 请求构建器（就地修改 unified_request）
+            excluded: {(block_index, term): chosen_meaning}
+
+        Returns:
+            被排除的出现位置数量。
+        """
+        if not excluded:
+            return 0
+
+        text_blocks = builder.unified_request.get("text_blocks", [])
+        removed_refs: dict[int, set[str]] = {}
+        for (block_idx, term), chosen in excluded.items():
+            if 0 <= block_idx < len(text_blocks):
+                removed_refs.setdefault(block_idx, set()).add(term)
+        if not removed_refs:
+            return 0
+
+        # 逐块移除引用（只动判定不适用处的那个块）
+        for block_idx, terms in removed_refs.items():
+            block = text_blocks[block_idx]
+            refs = block.get("proper_refs", [])
+            kept = [r for r in refs if r not in terms]
+            if len(kept) != len(refs):
+                if kept:
+                    block["proper_refs"] = kept
+                else:
+                    block.pop("proper_refs", None)
+
+        # 重新计算仍在任何块中引用的术语集合
+        referenced: set[str] = set()
+        for block in text_blocks:
+            referenced.update(block.get("proper_refs", []))
+        proper_terms = builder.unified_request.get("reference", {}).get("proper_terms", [])
+        builder.unified_request["reference"]["proper_terms"] = [
+            t for t in proper_terms if t.get("term", "") in referenced
+        ]
+
+        return sum(len(terms) for terms in removed_refs.values())
 
     # ========== 阶段 2：自校验 ==========
 

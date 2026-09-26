@@ -45,6 +45,14 @@ class TranslationSettings:
     disambiguation_mode: str
     min_confidence: str
     prompt_format: str
+    # --- Jev System One 决策模型（阶段 0 逐位置消歧，默认关闭）---
+    jev_enabled: bool = False
+    jev_api_key_env: str = "TYPESAFE_API_KEY"
+    jev_base_url: str = ""
+    jev_model: str = ""
+    jev_timeout: float = 60.0
+    jev_min_confidence: float = 0.9
+    jev_verify: bool = True
 
 
 @dataclass(frozen=True)
@@ -171,6 +179,19 @@ class AppConfig:
                 disambiguation_mode=disambiguation_mode,
                 min_confidence=min_confidence,
                 prompt_format=prompt_format,
+                jev_enabled=_optional_boolean(translation, "jev_enabled"),
+                jev_api_key_env=_optional_string(
+                    translation, "jev_api_key_env", default="TYPESAFE_API_KEY"
+                ),
+                jev_base_url=_optional_string(translation, "jev_base_url"),
+                jev_model=_optional_string(translation, "jev_model"),
+                jev_timeout=_optional_number(
+                    translation, "jev_timeout", default=60.0, minimum=1.0
+                ),
+                jev_min_confidence=_optional_number(
+                    translation, "jev_min_confidence", default=0.9, minimum=0.0,
+                ),
+                jev_verify=_optional_boolean(translation, "jev_verify", default=True),
             ),
             features=FeatureConfig(
                 enabled=_boolean(features, "enabled"),
@@ -215,8 +236,10 @@ def _string(parent: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
-def _optional_string(parent: dict[str, Any], key: str) -> str:
-    value = parent.get(key, "")
+def _optional_string(
+    parent: dict[str, Any], key: str, default: str = ""
+) -> str:
+    value = parent.get(key, default)
     if not isinstance(value, str):
         raise ConfigError(f"{key} 必须是字符串")
     return value.strip()
@@ -234,6 +257,29 @@ def _boolean(parent: dict[str, Any], key: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{key} 必须是布尔值")
     return value
+
+
+def _optional_boolean(
+    parent: dict[str, Any], key: str, default: bool = False
+) -> bool:
+    """可选布尔：缺失用默认值；提供了则必须是布尔。"""
+    if key not in parent:
+        return default
+    return _boolean(parent, key)
+
+
+def _optional_number(
+    parent: dict[str, Any], key: str, default: float, minimum: float
+) -> float:
+    """可选数值：缺失用默认值；提供了则必须是正数（允许 0 用于置信度等）。"""
+    if key not in parent:
+        return default
+    value = parent.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{key} 必须是数值")
+    if value < minimum:
+        raise ConfigError(f"{key} 不能小于 {minimum}")
+    return float(value)
 
 
 def _integer(

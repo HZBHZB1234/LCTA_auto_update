@@ -61,6 +61,17 @@ class TranslateConfig:
     new_terms_hot_update: bool = True  # 本次运行内即时热更新术语表
     new_terms_hot_update_batch: int = 20  # 累积多少条新词触发一次热更新
 
+    # --- Jev System One 决策模型（廉价判断：阶段 0 逐位置消歧等）---
+    # 默认关闭；开启后阶段 0 先尝试 Jev 逐块判断术语适用性，
+    # 失败/超时/零答案时自动回退到现有 LLM 消歧路径。
+    jev_enabled: bool = False
+    jev_api_key_env: str = "TYPESAFE_API_KEY"   # 从环境变量读 key（不落盘）
+    jev_base_url: str = ""                      # 空 = 官方端点；可用个人代理端点
+    jev_model: str = ""                         # 空 = 官方钉死版本 jev-1.13.0
+    jev_timeout: float = 60.0
+    jev_min_confidence: float = 0.9             # Choice 置信度低于此值不采纳
+    jev_verify: bool = True                     # SSL 校验（个人端点可能需要关闭）
+
     # --- 保存 ---
     save_result: bool = True
 
@@ -132,6 +143,13 @@ class TranslateConfig:
             new_terms_min_votes=configs.get("new_terms_min_votes", 1),
             new_terms_hot_update=configs.get("new_terms_hot_update", True),
             new_terms_hot_update_batch=configs.get("new_terms_hot_update_batch", 20),
+            jev_enabled=configs.get("jev_enabled", False),
+            jev_api_key_env=configs.get("jev_api_key_env", "TYPESAFE_API_KEY"),
+            jev_base_url=configs.get("jev_base_url", ""),
+            jev_model=configs.get("jev_model", ""),
+            jev_timeout=float(configs.get("jev_timeout", 60.0)),
+            jev_min_confidence=float(configs.get("jev_min_confidence", 0.9)),
+            jev_verify=bool(configs.get("jev_verify", True)),
         )
 
 

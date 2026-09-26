@@ -80,6 +80,20 @@ translation:
   # 提示词格式：xml_json / xml_xml / json_json
   prompt_format: "xml_json"
 
+  # ---------- Jev System One 决策模型（可选，默认关闭） ----------
+  # 开启后，阶段 0 先用 Jev 逐位置判断术语适用性（一次请求批量化，
+  # 只从判定不适用处移除该术语引用），失败时自动回退现有 LLM 消歧。
+  # 强烈建议钉死 jev_model（如 jev-1.13.0），jev-latest 会随官方漂移。
+  # 官方端点 base_url 留空即用 https://api.typesafe.ai/v1/systemone；
+  # 个人代理端点示例：https://sub.nekopeer.com/v1/systemone
+  jev_enabled: false
+  jev_api_key_env: "TYPESAFE_API_KEY"
+  jev_base_url: ""
+  jev_model: "jev-1.13.0"
+  jev_timeout: 60.0
+  jev_min_confidence: 0.9
+  jev_verify: true
+
 # ---------- 功能开关 ----------
 features:
   # 总开关：关闭后跳过所有自动更新流程
