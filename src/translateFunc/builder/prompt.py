@@ -769,11 +769,18 @@ class PromptFactory:
 
         防御性收口：stale 证据与 name_only 作用域的条目即使被上游误标为 hard，
         也一律降为 soft——它们绝不能进强制译名区。
+
+        另外，中文含斜杠多译名（如 ``贾惜春/卫``、``A / B``）的词条无法确定
+        该用哪一个分支，直接不投递（返回 candidate 即被两个渲染器跳过），
+        避免模型在多个候选译名之间随机选错。
         """
         tier = str(term.get("tier", "hard")).lower()
         if tier not in ("hard", "soft", "candidate"):
             tier = "hard"
         if tier == "candidate":
+            return "candidate"
+        cn = str(term.get("cn") or term.get("translation") or "")
+        if "/" in cn or "／" in cn:
             return "candidate"
         if bool(term.get("stale")):
             return "soft"

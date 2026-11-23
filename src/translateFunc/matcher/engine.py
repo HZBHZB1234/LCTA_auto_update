@@ -8,6 +8,81 @@ import threading
 
 from translateFunc.matcher.ac_automaton import AcAutomaton, ACPattern
 
+# 名称类字段：scope.match=name_only 只允许在这些字段命中
+NAME_FIELDS = frozenset({"name", "teller", "title", "keyword", "summary"})
+
+# 「短词面」阈值。域门只拦 ≤2 字纯韩文（기사/두려움/흰색 这类同形高危词），
+# 3 字及以上即便跨域也放行——가시춘(贾惜春) 这类人名常挂在 ui_or_data，
+# 若按域硬拦，剧情正文就永远拿不到官方译名（审查实测 M1/M2 同类误杀）。
+DOMAIN_GATE_MAX_LEN = 2
+# 软档短词面不进非名称字段的上限（比域门宽一档：검정색/노란색 等颜色标签
+# 是 3 字软词，必须挡住，否则「검정색 연기」会被提示成「哀叹」）。
+SOFT_PROSE_MAX_LEN = 3
+
+
+def _is_hangul(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0xAC00 <= code <= 0xD7A3
+        or 0x1100 <= code <= 0x11FF
+        or 0x3130 <= code <= 0x318F
+    )
+
+
+def is_pure_hangul(text: str) -> bool:
+    return bool(text) and all(_is_hangul(ch) for ch in text)
+
+
+def is_short_surface(text: str, max_len: int) -> bool:
+    """纯韩文且不超过 max_len 的词面——同形碰撞的高危区。"""
+    return bool(text) and len(text) <= max_len and is_pure_hangul(text)
+
+
+def scope_allows(item: dict, *, domain: str = "", field: str = "") -> bool:
+    """判断词条作用域是否允许在当前 (domain, field) 命中。
+
+    术语库的 scope 是元数据，历史上从未在运行时执行，导致字段/域受限词条
+    （如仅 title 的 기사→司机）泄漏到正文。这里统一收口：
+
+      * domains：**只对 ≤2 字纯韩文词面硬拦**。长词面同形歧义低，若也硬拦，
+        会让 95% 非 story 域的人名在剧情正文里彻底失效（格里高尔/猩红视线）；
+      * match=name_only：只允许名称类字段；
+      * match=entity_bound/exact_sentence：有 fields 时按字段强制；
+      * match=unbound：软档短词面（≤3）不进非名称字段。
+    """
+    scope = item.get("scope") or {}
+    if not isinstance(scope, dict) or not scope:
+        return True
+
+    match = str(scope.get("match") or "")
+    domains = [str(x) for x in (scope.get("domains") or []) if x]
+    fields = [str(x) for x in (scope.get("fields") or []) if x]
+    kr = str(item.get("term") or item.get("kr") or "")
+
+    if (
+        domain and domains and domain not in domains
+        and is_short_surface(kr, DOMAIN_GATE_MAX_LEN)
+    ):
+        return False
+    if match == "name_only":
+        return field in NAME_FIELDS if field else True
+    if match in ("entity_bound", "exact_sentence"):
+        return (not fields) or (not field) or (field in fields)
+    if match == "unbound" and field and field not in NAME_FIELDS:
+        tier = str(item.get("tier", "hard"))
+        if tier == "soft" and is_short_surface(kr, SOFT_PROSE_MAX_LEN):
+            return False
+    return True
+
+
+def _filter_by_scope(matches: list[ACPattern], domain: str, field: str) -> list[ACPattern]:
+    if not domain and not field:
+        return matches
+    return [
+        m for m in matches
+        if not isinstance(m.data, dict) or scope_allows(m.data, domain=domain, field=field)
+    ]
+
 
 @dataclass
 class MatchResult:
@@ -50,7 +125,11 @@ class MatcherEngine:
     # ----- 构建 -----
 
     def build_proper(self, proper_terms: list[dict]) -> None:
-        """从 [{term, translation, note, ...}, ...] 构建专有名词 AC 自动机。"""
+        """从 [{term, translation, note, ...}, ...] 构建专有名词 AC 自动机。
+
+        收口规则：candidate 不进 AC；单字词面不进 AC（如 ``나``→我、``부``→富
+        会在任何正文里误命中，是术语噪声的最大来源之一）。
+        """
         with self._proper_lock:
             self._proper_data = {}
             for item in proper_terms:
@@ -58,6 +137,8 @@ class MatcherEngine:
                 if str(item.get("tier", "hard")) == "candidate":
                     continue
                 term = item.get("term", "")
+                if term and len(term) < 2:
+                    continue
                 if term and term not in self._proper_data:
                     self._proper_data[term] = item
             self._proper_ac = self._build_proper_ac(self._proper_data)
@@ -80,7 +161,12 @@ class MatcherEngine:
         with self._proper_lock:
             added = 0
             for item in items or []:
+                # 与 build_proper 同口径：candidate 与单字词面都不进自动机
+                if str(item.get("tier", "hard")) == "candidate":
+                    continue
                 term = (item.get("term") or "").strip()
+                if term and len(term) < 2:
+                    continue
                 if term and term not in self._proper_data:
                     self._proper_data[term] = item
                     added += 1
@@ -143,14 +229,22 @@ class MatcherEngine:
         *,
         jp_text: str = "",
         en_text: str = "",
+        domain: str = "",
+        field: str = "",
     ) -> MatchResult:
-        """对文本运行全部匹配器，并用 JP/EN 参考过滤韩文名称误匹配。"""
+        """对文本运行全部匹配器，并用 JP/EN 参考过滤韩文名称误匹配。
+
+        ``domain`` / ``field`` 用于执行词条作用域（scope）：不满足的词条
+        不会进入 proper_refs，从源头阻断跨域/跨字段的术语误用。
+        """
         affect_name_matches = [
             match for match in self._affect_name_ac.search(text)
             if self._is_affect_name_supported(match.data, text, jp_text, en_text)
         ]
         return MatchResult(
-            proper_matches=self._proper_ac.search(text),
+            proper_matches=_filter_by_scope(
+                self._proper_ac.search_non_overlapping(text), domain, field,
+            ),
             role_matches=self._role_ac.search(text),
             affect_id_matches=self._affect_id_ac.search(text),
             affect_name_matches=affect_name_matches,
@@ -178,9 +272,13 @@ class MatcherEngine:
 
         return any(comparisons) if comparisons else True
 
-    def match_proper(self, text: str) -> list[ACPattern]:
-        """仅匹配专有名词。"""
-        return self._proper_ac.search(text)
+    def match_proper(
+        self, text: str, *, domain: str = "", field: str = "",
+    ) -> list[ACPattern]:
+        """仅匹配专有名词（最长匹配优先 + 作用域过滤）。"""
+        return _filter_by_scope(
+            self._proper_ac.search_non_overlapping(text), domain, field,
+        )
 
     # ----- 访问器 -----
 

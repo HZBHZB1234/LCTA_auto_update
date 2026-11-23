@@ -297,6 +297,14 @@ class FileProcessor:
         except Exception:
             return ""
 
+    def _domain(self) -> str:
+        """文件语料域（story/mechanic/voice/ui_or_data），用于术语 scope 收口。"""
+        try:
+            from translateFunc.termdb.config import file_kind
+            return file_kind(self._relative_path())
+        except Exception:  # noqa: BLE001 - 域判定失败时退化为不限域
+            return ""
+
     def _write_processing_log(self, outcome: ProcessOutcome, start_time: float) -> None:
         """将单文件处理结果追加写入 JSONL 日志文件。"""
         try:
@@ -566,6 +574,7 @@ class FileProcessor:
             is_skill=self.is_skill,
             max_length=20000,
             file_type=self.file_type,
+            domain=self._domain(),
         )
 
         if self._config.is_llm:
@@ -2223,6 +2232,14 @@ class FileProcessor:
             term = item.get("term", "")
             if not term:
                 continue
+            # 没有实际含义的消歧结论是「半截证据」：P0 规则要求模型按
+            # actual_meaning 翻译，空的反而制造矛盾约束，直接丢弃。
+            actual_meaning = str(item.get("actual_meaning", "") or "").strip()
+            if not actual_meaning:
+                _logger.debug(
+                    f"[{self.file_name}] 跳过空 actual_meaning 的消歧结论: {term}"
+                )
+                continue
             excluded_terms.add(term)
 
             cand = candidate_index.get(term, {})
@@ -2237,7 +2254,7 @@ class FileProcessor:
             record = {
                 "term": term,
                 "cn": cand.get("cn") or cn_by_term.get(term, ""),
-                "actual_meaning": item.get("actual_meaning", ""),
+                "actual_meaning": actual_meaning,
                 "reason": item.get("reason", ""),
             }
             for block_idx in indices:
@@ -2430,10 +2447,16 @@ class FileProcessor:
             t.get("term", ""): t.get("translation", t.get("cn", ""))
             for t in builder.unified_request.get("reference", {}).get("proper_terms", [])
         }
-        removed_refs: dict[int, set[str]] = {}
+        removed_refs: dict[int, dict[str, str]] = {}
         for (block_idx, term), chosen in excluded.items():
+            meaning = str(chosen or "").strip()
+            # 无实际含义时不写 do_not_apply、也不移除引用：空 actual_meaning
+            # 与 P0 规则「按 actual_meaning 翻译」矛盾，且强删引用会让模型
+            # 在无任何提示下自由发挥（碰撞场景还会连带误伤长词）。
+            if not meaning:
+                continue
             if 0 <= block_idx < len(text_blocks):
-                removed_refs.setdefault(block_idx, set()).add(term)
+                removed_refs.setdefault(block_idx, {})[term] = meaning
         if not removed_refs:
             return 0
 
@@ -2441,13 +2464,13 @@ class FileProcessor:
         for block_idx, terms in removed_refs.items():
             block = text_blocks[block_idx]
             markers = block.setdefault("do_not_apply", [])
-            for term in terms:
+            for term, meaning in terms.items():
                 if any(m.get("term") == term for m in markers):
                     continue
                 markers.append({
                     "term": term,
                     "cn": cn_by_term.get(term, ""),
-                    "actual_meaning": "",
+                    "actual_meaning": meaning,
                     "reason": "Jev 逐位置判定该词在此处不适用",
                 })
             refs = block.get("proper_refs", [])
@@ -2458,12 +2481,14 @@ class FileProcessor:
                 else:
                     block.pop("proper_refs", None)
 
-        # 重新计算仍在任何块中引用的术语集合
+        # 重新计算仍在任何块中引用的术语集合（Jev 路径按出现位置排除后，
+        # 已无任何块引用的术语不再投递，避免请求里残留未被引用的词条）。
         referenced: set[str] = set()
         for block in text_blocks:
             referenced.update(block.get("proper_refs", []))
-        proper_terms = builder.unified_request.get("reference", {}).get("proper_terms", [])
-        builder.unified_request["reference"]["proper_terms"] = [
+        reference = builder.unified_request.get("reference", {})
+        proper_terms = reference.get("proper_terms", [])
+        reference["proper_terms"] = [
             t for t in proper_terms if t.get("term", "") in referenced
         ]
 

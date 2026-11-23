@@ -21,6 +21,20 @@ class ACPattern:
     data: Any = None
 
 
+def _is_hangul(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0xAC00 <= code <= 0xD7A3
+        or 0x1100 <= code <= 0x11FF
+        or 0x3130 <= code <= 0x318F
+    )
+
+
+def _is_hangul_short_surface(text: str) -> bool:
+    """纯韩文且 ≤2 字——语法残片高发区。"""
+    return bool(text) and len(text) <= 2 and all(_is_hangul(ch) for ch in text)
+
+
 class AcAutomaton:
     """Aho-Corasick 多模式字符串匹配自动机。"""
 
@@ -82,6 +96,63 @@ class AcAutomaton:
             if self._output[node]:
                 result.extend(self._output[node])
         return result
+
+    def search_spans(self, text: str) -> list[tuple[int, int, ACPattern]]:
+        """返回全部命中的 ``(start, end, pattern)``；end 为开区间。
+
+        ``search()`` 只给 ACPattern，无法判断重叠关系；术语碰撞治理需要
+        位置信息，故单独提供带区间的视图。
+        """
+        if not self._built:
+            raise RuntimeError("必须在 search_spans() 之前调用 build()")
+        if not text:
+            return []
+        spans: list[tuple[int, int, ACPattern]] = []
+        node = 0
+        for i, ch in enumerate(text):
+            while node != 0 and ch not in self._trie[node]:
+                node = self._fail[node]
+            node = self._trie[node].get(ch, 0)
+            for pat in self._output[node]:
+                spans.append((i + 1 - len(pat.pattern), i + 1, pat))
+        return spans
+
+    def search_non_overlapping(
+        self, text: str, *, hangul_short_boundary: bool = True,
+    ) -> list[ACPattern]:
+        """最长匹配优先的不重叠命中集合（用于术语注入，避免子串碰撞）。
+
+        规则一（最长匹配）：同一覆盖区间只保留最长词面——左起、同起点取最长，
+        后续与之重叠的短词一律丢弃。解决 ``가시/가시춘``、``K사/K사 둥지``、
+        ``1번 편성 효과/11번 편성 효과``、``나/나태`` 这类嵌套命中。
+
+        规则二（短词前界）：纯韩文且 ≤2 字的词面，若紧邻的**前一个字符也是
+        韩文**，判为更长词内部的语法残片并丢弃——例如 ``열릴지도`` 里的
+        ``지도``（地图）。只看前界、不看后界：韩文助词紧贴词干
+        （``기사에게``、``K사가``），后界校验会误杀正常命中。
+
+        纯拉丁/含数字/引号包裹的词面（``K사``、``[Bleed]``、``「적응」``）不参与
+        前界校验。
+        """
+        spans = self.search_spans(text)
+        if not spans:
+            return []
+        chosen: list[ACPattern] = []
+        occupied: list[tuple[int, int]] = []
+        for start, end, pat in sorted(spans, key=lambda s: (s[0], -(s[1] - s[0]))):
+            if any(start < used_end and end > used_start
+                   for used_start, used_end in occupied):
+                continue
+            if (
+                hangul_short_boundary
+                and start > 0
+                and _is_hangul_short_surface(pat.pattern)
+                and _is_hangul(text[start - 1])
+            ):
+                continue
+            occupied.append((start, end))
+            chosen.append(pat)
+        return chosen
 
     def search_batch(self, texts: list[str]) -> list[list[ACPattern]]:
         """批量搜索多个文本。每个输入文本返回一个匹配列表。"""

@@ -30,6 +30,7 @@ class RequestBuilder:
         is_skill: bool = False,
         max_length: int = 20000,
         file_type: FileType = FileType.OTHER,
+        domain: str = "",
     ):
         self.kr_text = request_text["kr"]
         self.jp_text = request_text.get("jp", {})
@@ -39,9 +40,21 @@ class RequestBuilder:
         self.is_skill = is_skill
         self.max_length = max_length
         self.file_type = file_type
+        # 文件域（story/mechanic/voice/ui_or_data）：用于执行术语 scope.domains
+        self.domain = domain
         # 构建状态
         self.unified_request: dict | None = None
         self.split_requests: list[dict] = []
+
+    @staticmethod
+    def _field_of(path) -> str:
+        """从扁平化路径取字段名（最后一个字符串键）。"""
+        if isinstance(path, tuple) and path:
+            last = path[-1]
+            return last if isinstance(last, str) else ""
+        if isinstance(path, str):
+            return path
+        return ""
 
     # ========== 构建 ==========
 
@@ -76,8 +89,12 @@ class RequestBuilder:
                     "en": en_text_val,
                 }
 
-                # 匹配专有名词
-                match_result = self._engine.match_all(kr_text_val)
+                # 匹配专有名词（最长匹配优先 + scope 过滤）
+                match_result = self._engine.match_all(
+                    kr_text_val,
+                    domain=self.domain,
+                    field=self._field_of(path_tuple),
+                )
                 if match_result.proper_matches:
                     text_block["proper_refs"] = []
                     for m in match_result.proper_matches:

@@ -608,7 +608,7 @@ class LandingReport:
         return out
 
     def to_landing_records(self) -> list[dict]:
-        """转成 tools.termdb terms-landing 可消费的回流记录。"""
+        """转成 translateFunc.termdb terms-landing 可消费的回流记录。"""
         return [
             {"term_key": o.term_key, "landing": o.landing, "note": o.note}
             for o in self.observations
@@ -621,13 +621,20 @@ class TermLandingValidator:
 
     设计约束：
       * 零模型、零人工审批，只产出风险信号，不改译文、不阻断导出；
-      * 单体词 / name_only / candidate 不参与正文子串判定（避免误报误伤）；
-      * 词面取自兼容视图的 ``term`` 字段（运行时唯一索引键），与
-        ProperAnalyzer / build_proper 完全同口径。
+      * 匹配口径与 stage 1 完全一致：**最长匹配优先 + 不重叠**，并执行
+        ``scope``（域/字段）。否则子串碰撞会制造假 missing，把正确术语
+        反向降档（自腐蚀）；
+      * 不用 2-gram 滑窗判 partial —— 短词会在大词译文里假命中；
+      * 斜杠多译名（``A / B``）无法确定性核对，直接不参与观测。
     """
 
     def __init__(self, proper_terms: list[dict], *, hard_only: bool = True):
+        from translateFunc.matcher.ac_automaton import AcAutomaton
+
         self._registry: list[tuple[str, str, str, str]] = []
+        self._by_kr: dict[str, dict] = {}
+        self._ac = AcAutomaton()
+        seen: set[str] = set()
         for t in proper_terms or []:
             if not isinstance(t, dict):
                 continue
@@ -641,42 +648,59 @@ class TermLandingValidator:
                 continue
             kr = str(t.get("term", "") or "")
             zh = str(t.get("translation", "") or t.get("cn", "") or "")
-            if not (kr and zh):
+            if not (kr and zh) or len(kr) < 2:
                 continue
+            if "/" in zh or "／" in zh:
+                continue  # 多译名条目无法确定性判落位
             key = f"{t.get('entity_id', '')}|{t.get('sense', '')}"
             self._registry.append((key, kr, zh, tier))
+            self._by_kr.setdefault(kr, t)
+            if kr not in seen:
+                seen.add(kr)
+                self._ac.add_pattern(kr)
+        self._ac.build()
         self._registry.sort(key=lambda x: (-len(x[1]), x[1]))
+
+    def _hits(self, text: str, field: str, domain: str) -> set[str]:
+        """对单块文本做与运行时一致的最长匹配 + scope 过滤。"""
+        from translateFunc.matcher.engine import scope_allows
+
+        if not text:
+            return set()
+        allowed: set[str] = set()
+        for pat in self._ac.search_non_overlapping(text):
+            item = self._by_kr.get(pat.pattern)
+            if item is not None and not scope_allows(item, domain=domain, field=field):
+                continue
+            allowed.add(pat.pattern)
+        return allowed
 
     def check(self, text_blocks: list[dict], translations: list[str]) -> LandingReport:
         report = LandingReport()
         n = min(len(text_blocks), len(translations))
+        hits_by_block: dict[int, set[str]] = {}
+        for i in range(n):
+            block = text_blocks[i] or {}
+            hits_by_block[i] = self._hits(
+                str(block.get("kr", "") or ""),
+                str(block.get("field", "") or ""),
+                str(block.get("domain", "") or ""),
+            )
+
         for key, kr, zh, tier in self._registry:
-            hits: list[int] = []
-            for i in range(n):
-                src = str((text_blocks[i] or {}).get("kr", "") or "")
-                if kr in src:
-                    hits.append(i + 1)
+            hits = [i + 1 for i in range(n) if kr in hits_by_block[i]]
             if not hits:
                 report.observations.append(LandingObservation(
                     key, kr, zh, "none", note=f"tier={tier}"))
                 continue
-            applied = partial = 0
+            applied = 0
             for idx in hits:
                 out = str(translations[idx - 1] or "")
                 if zh in out:
                     applied += 1
-                elif len(zh) >= 2 and any(
-                    zh[j:j + 2] in out for j in range(len(zh) - 1)
-                ):
-                    partial += 1
-            if applied:
-                landing = "applied"
-            elif partial:
-                landing = "partial"
-            else:
-                landing = "missing"
+            landing = "applied" if applied else "missing"
             report.observations.append(LandingObservation(
                 key, kr, zh, landing, hit_blocks=hits,
-                note=f"tier={tier};hits={len(hits)};applied={applied};partial={partial}",
+                note=f"tier={tier};hits={len(hits)};applied={applied}",
             ))
         return report

@@ -259,20 +259,30 @@ class TranslationPipeline:
         for o in outcomes:
             self._record_outcome(o, summary)
 
-        # 8.4 落位自动回流：零人工 CLI 的自动矫正闭环。
-        #     用本轮已保存的译文与 KR 源文按结构路径配对，跑 hard 档四态落位校验，
-        #     回流状态机（失败计数/降级/衰减）并重导出兼容视图。
+        # 8. 新专有名词落盘（下次运行启动时合并进术语表）
+        if self._new_term_collector is not None:
+            saved = self._new_term_collector.flush()
+            if saved:
+                self._log_bridge.info(
+                    f"已记录 {saved} 条新专有名词 → {self._new_terms_path()}"
+                )
+
+        # 8.5 落位自动回流：零人工 CLI 的自动矫正闭环。
+        #     必须在新词落盘之后执行：回流用的是本轮已保存译文，先落盘新词
+        #     才不会让本轮候选被当成「既有权威词条」参与落位判定。
+        #     只降不升（见 terms_feedback.run_feedback_loop），并用与 stage 1
+        #     一致的最长匹配 + scope 口径，避免子串碰撞反向降档正确术语。
         #     这是附加产出：任何异常只记 debug，绝不影响翻译主流程。
         if self._config.enable_proper and self._engine.proper_terms:
             try:
-                from tools.termdb import terms_feedback  # noqa: WPS433
-                saved_pairs: list[tuple[Path, Path]] = []
+                from translateFunc.termdb import terms_feedback  # noqa: WPS433
+                saved_pairs: list[tuple] = []
                 for src in target_files:
                     fpc = FilePathConfig(
                         KR_path=src, _PathConfig=base_path_config, has_prefix=has_prefix,
                     )
                     if fpc.target_file.is_file():
-                        saved_pairs.append((src, fpc.target_file))
+                        saved_pairs.append((src, fpc.target_file, fpc.rel_path))
                 feedback = terms_feedback.run_pipeline_feedback(
                     Path(__file__).resolve().parents[2],
                     saved_pairs,
@@ -281,18 +291,11 @@ class TranslationPipeline:
                 if feedback.get("landing_records"):
                     self._log_bridge.info(
                         f"落位自动回流：观测 {feedback['landing_records']} 条，"
+                        f"降档输入 {feedback.get('downgrade_records', 0)} 条，"
                         f"状态变更 {feedback.get('state_changes', 0)} 条"
                     )
             except Exception as exc:  # noqa: BLE001 - 附加产出不影响主流程
                 _logger.debug(f"落位自动回流跳过：{type(exc).__name__}: {exc}")
-
-        # 8. 新专有名词落盘（下次运行启动时合并进术语表）
-        if self._new_term_collector is not None:
-            saved = self._new_term_collector.flush()
-            if saved:
-                self._log_bridge.info(
-                    f"已记录 {saved} 条新专有名词 → {self._new_terms_path()}"
-                )
 
         # 9. 输出剖析报告
         self._on_progress(90, "已完成汉化")
