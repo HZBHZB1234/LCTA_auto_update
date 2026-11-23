@@ -641,7 +641,10 @@ class FileProcessor:
                                             f"{part_idx + 1}/{len(stage_0_parts)}："
                                             f"{len(disambiguated)} 个术语被评估"
                                         )
-                                        self._apply_disambiguation(builder, disambiguated)
+                                        self._apply_disambiguation(
+                                            builder, disambiguated,
+                                            candidate_terms=stage_0_part["candidate_terms"],
+                                        )
                                     else:
                                         _logger.debug(
                                             f"[{self.file_name}] 阶段 0 消歧 "
@@ -2176,42 +2179,92 @@ class FileProcessor:
         return result
 
     def _apply_disambiguation(
-        self, builder: "RequestBuilder", disambiguated: list[dict]
+        self,
+        builder: "RequestBuilder",
+        disambiguated: list[dict],
+        candidate_terms: list[dict] | None = None,
     ) -> None:
-        """将消歧结果应用到 builder 的术语表。
+        """将阶段 0 消歧结论硬化为**块级负向约束**（而非整词删除）。
 
-        对 applies=false 的术语，从 unified_request["reference"]["proper_terms"] 中移除，
-        并通过 unified_request["text_blocks"] 中对应的 proper_refs 清除引用。
+        旧实现把 applies=false 的术语从 reference.proper_terms 中整词删除——
+        粒度太粗（其他块可能适用），且结论只是"缺少正向信号"，下游极易覆盖
+        （巳色次元回归的根因）。现在：
+
+        - 术语**保留**在 reference.proper_terms（其他块仍可命中全名）；
+        - 决策按候选记录里的 ``text_block_indices`` 绑定到具体块，写入块上的
+          新承载字段 ``do_not_apply``（term / cn / actual_meaning / reason）；
+        - 同时清掉这些块 ``proper_refs`` 中对该词的引用，避免正向信号冲突。
+
+        ``do_not_apply`` 挂在 text_blocks 上，不会被引擎按 term 过滤/删除
+        （processor 的 2199/2399 两段列表推导只重建 proper_terms）。
         """
         if not disambiguated:
             return
 
+        text_blocks = builder.unified_request.get("text_blocks", [])
+        # term → 送入阶段 0 的候选记录（含出现块索引与译名）
+        candidate_index: dict[str, dict] = {}
+        for cand in candidate_terms or []:
+            kr = cand.get("kr", "") or cand.get("term", "")
+            if kr:
+                candidate_index[kr] = cand
+        # 退化路径（无候选记录）也要拿到常规译名，与 Jev 路径字段一致：
+        # 否则 do_not_apply 缺 cn，渲染时 <usual_cn> 缺失，模型无从得知禁的是哪个译名。
+        cn_by_term = {
+            t.get("term", ""): t.get("translation", t.get("cn", ""))
+            for t in builder.unified_request.get("reference", {}).get("proper_terms", [])
+        }
+
         excluded_terms: set[str] = set()
+        marked_blocks = 0
         for item in disambiguated:
-            if not item.get("applies", True):
-                excluded_terms.add(item.get("term", ""))
+            if item.get("applies", True):
+                continue
+            term = item.get("term", "")
+            if not term:
+                continue
+            excluded_terms.add(term)
+
+            cand = candidate_index.get(term, {})
+            indices = [i for i in cand.get("text_block_indices", []) if isinstance(i, int)]
+            if not indices:
+                # 退化路径：无候选记录时从块引用反查，保证仍能落到块级
+                indices = [
+                    i for i, block in enumerate(text_blocks)
+                    if term in block.get("proper_refs", [])
+                ]
+
+            record = {
+                "term": term,
+                "cn": cand.get("cn") or cn_by_term.get(term, ""),
+                "actual_meaning": item.get("actual_meaning", ""),
+                "reason": item.get("reason", ""),
+            }
+            for block_idx in indices:
+                if not (0 <= block_idx < len(text_blocks)):
+                    continue
+                block = text_blocks[block_idx]
+                markers = block.setdefault("do_not_apply", [])
+                if any(m.get("term") == term for m in markers):
+                    continue  # 幂等：同一术语同一块只写一次
+                markers.append(dict(record))
+                marked_blocks += 1
+
+                # 清除该块内对该词的正向引用（其他块不受影响）
+                refs = block.get("proper_refs", [])
+                if refs:
+                    kept = [r for r in refs if r != term]
+                    if kept:
+                        block["proper_refs"] = kept
+                    else:
+                        block.pop("proper_refs", None)
 
         if not excluded_terms:
             return
 
-        # 从 reference 中移除不适用的术语
-        proper_terms = builder.unified_request.get("reference", {}).get("proper_terms", [])
-        builder.unified_request["reference"]["proper_terms"] = [
-            t for t in proper_terms
-            if t.get("term", "") not in excluded_terms
-        ]
-
-        # 从 text_blocks 中清除对应引用
-        text_blocks = builder.unified_request.get("text_blocks", [])
-        for block in text_blocks:
-            refs = block.get("proper_refs", [])
-            if refs:
-                block["proper_refs"] = [r for r in refs if r not in excluded_terms]
-                if not block["proper_refs"]:
-                    del block["proper_refs"]
-
         _logger.info(
-            f"[{self.file_name}] 阶段 0 消歧：排除了 {len(excluded_terms)} 个不适用的术语: "
+            f"[{self.file_name}] 阶段 0 消歧：对 {len(excluded_terms)} 个不适用术语写入 "
+            f"块级 do_not_apply（覆盖 {marked_blocks} 个文本块），术语本身保留在术语表中: "
             f"{', '.join(sorted(excluded_terms))}"
         )
 
@@ -2373,6 +2426,10 @@ class FileProcessor:
             return 0
 
         text_blocks = builder.unified_request.get("text_blocks", [])
+        cn_by_term = {
+            t.get("term", ""): t.get("translation", t.get("cn", ""))
+            for t in builder.unified_request.get("reference", {}).get("proper_terms", [])
+        }
         removed_refs: dict[int, set[str]] = {}
         for (block_idx, term), chosen in excluded.items():
             if 0 <= block_idx < len(text_blocks):
@@ -2380,9 +2437,19 @@ class FileProcessor:
         if not removed_refs:
             return 0
 
-        # 逐块移除引用（只动判定不适用处的那个块）
+        # 逐块移除引用（只动判定不适用处的那个块），并写块级负向约束
         for block_idx, terms in removed_refs.items():
             block = text_blocks[block_idx]
+            markers = block.setdefault("do_not_apply", [])
+            for term in terms:
+                if any(m.get("term") == term for m in markers):
+                    continue
+                markers.append({
+                    "term": term,
+                    "cn": cn_by_term.get(term, ""),
+                    "actual_meaning": "",
+                    "reason": "Jev 逐位置判定该词在此处不适用",
+                })
             refs = block.get("proper_refs", [])
             kept = [r for r in refs if r not in terms]
             if len(kept) != len(refs):

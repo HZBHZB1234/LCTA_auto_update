@@ -81,11 +81,17 @@ class RuleBasedValidator:
         # 反向映射：中文显示名（含尾随空格变体）→ 引擎代码ID，
         # 用于将错误放入括号的中文名还原为 [EnglishId]。
         self._cn_to_id: dict[str, str] = {}
+        # scope 明确标为 name_only / fields=["name"] 的词条：尾空格规则豁免
+        self._name_field_cn: set[str] = set()
 
         for a in affects_data:
             cn = a.get("cn", "")
             aid = a.get("id", "")
             kr = a.get("kr", "")
+            scope = a.get("scope") or {}
+            fields = scope.get("fields") or []
+            if cn and (fields == ["name"] or scope.get("match") == "name_only"):
+                self._name_field_cn.add(cn)
             if cn:
                 self._affect_cn_names.add(cn)
                 if aid:
@@ -117,6 +123,12 @@ class RuleBasedValidator:
         )
         report.violations.extend(
             self.validate_bracketed_cn_buffs(translations)
+        )
+        report.violations.extend(
+            self.validate_buff_trailing_space(translations, text_blocks)
+        )
+        report.violations.extend(
+            self.validate_cjk_quotes(translations, text_blocks)
         )
 
         report.warnings_remaining = sum(
@@ -176,6 +188,19 @@ class RuleBasedValidator:
                             + sub.replace(old, new, 1)
                             + text[search_end:]
                         )
+                elif v.fix_fn == "insert" and v.fix_params:
+                    # 精确位置插入，不靠窗口内字符串匹配（同一状态名可能多次出现）
+                    pos = v.fix_params.get("position", 0)
+                    ins = v.fix_params.get("text", "")
+                    if 0 <= pos <= len(text):
+                        text = text[:pos] + ins + text[pos:]
+                elif v.fix_fn == "char_replace" and v.fix_params:
+                    # 按精确下标替换单字符（引号成对出现在窗口内时不会错换）
+                    pos = v.fix_params.get("position", 0)
+                    old = v.fix_params.get("old", "")
+                    new = v.fix_params.get("new", "")
+                    if 0 <= pos < len(text) and text[pos] == old:
+                        text = text[:pos] + new + text[pos + len(old):]
 
             result[idx] = text
 
@@ -244,6 +269,123 @@ class RuleBasedValidator:
                     },
                 ))
 
+        return violations
+
+    def validate_buff_trailing_space(
+        self, translations: list[str], text_blocks: list[dict] | None = None,
+    ) -> list[ValidationViolation]:
+        """检测正文中状态效果中文名后被 strip 的半角空格（零模型规则修复）。
+
+        官方写法要求状态名嵌在 desc/summary/整句中时保留一个半角空格
+        （如「对攻击者施加1层烧伤 」、「充能 层数」），即使位于句尾或标点前；
+        但整条仅为状态名的 name/title 字段官方无尾空格（如「烧伤」），
+        必须豁免，否则会误伤 RG-BURN-NAME。方括号内的引擎 ID 不适用本规则。
+
+        name 字段判定（零模型）：译文全文恰为某个状态名、或原文全文恰为
+        某个状态名的 KR 词面；另尊重 affects 条目自带的 scope.fields /
+        scope.match 元数据。
+
+        Returns:
+            违规列表，全部可通过插入空格自动修复。
+        """
+        violations: list[ValidationViolation] = []
+        for block_idx, cn_text in enumerate(translations):
+            if not cn_text:
+                continue
+
+            source_kr = ""
+            if text_blocks and block_idx < len(text_blocks):
+                source_kr = str(text_blocks[block_idx].get("kr", "")).strip()
+            # name 字段：整条译文/原文就是单独一个状态名 → 全局豁免本块
+            if cn_text.strip() in self._affect_cn_names:
+                continue
+            if source_kr and source_kr in self._affect_kr_to_cn:
+                continue
+
+            bracket_spans = [m.span() for m in self._BRACKET_REF_RE.finditer(cn_text)]
+            occupied: list[tuple[int, int]] = []
+            for name in self._sorted_cn_names:
+                if not name or name in self._name_field_cn:
+                    continue  # scope 明确标记为 name_only 的词条
+                pattern = re.compile(re.escape(name) + r"(?!\s)")
+                for m in pattern.finditer(cn_text):
+                    start, end = m.start(), m.end()
+                    if any(a <= start < b for a, b in bracket_spans):
+                        continue  # [ID] 内部不受尾空格规则约束
+                    if any(start < b and a < end for a, b in occupied):
+                        continue  # 长名已覆盖，避免重名重复插入
+                    occupied.append((start, end))
+                    violations.append(ValidationViolation(
+                        block_id=block_idx + 1,
+                        rule="buff_trailing_space",
+                        severity="error",
+                        message=f"状态名'{name}'后缺少半角空格（不得 strip）",
+                        auto_fixable=True,
+                        fix_fn="insert",
+                        fix_params={"position": end, "text": " "},
+                    ))
+
+        return violations
+
+    # 原文的「…」片段：视为必须逐字保留的原文引用（与收紧后的 P1 例外一致）
+    _VERBATIM_QUOTE_RE = re.compile(r"「[^」]*」")
+
+    @staticmethod
+    def validate_cjk_quotes(
+        translations: list[str],
+        text_blocks: list[dict] | None = None,
+    ) -> list[ValidationViolation]:
+        """把 zh-CN 正文里的日式直角引号「」归一为中文双引号“”（零模型确定性修复）。
+
+        官方语料依据（只读引用）：历史回放 gold hv2026111901-ui-92dccb260f0f
+        把 KR 的「적응」译为“适应”、「부적응」译为“不适应”；RG-BAN-CJK-QUOTE
+        把 JP 的「これが最後の一撃だ…！」译为“这就是最后一击了……！”。
+        原文里的「」只是引用标记，普通正文照搬到「适应」是风格回退，必须归一。
+
+        不触碰（与收紧后的 P1 例外保持一致）：
+          * 占位符 / ID / 富文本标签：<0>、{0}、[Bleed]、<color=…> 内部不含「」，
+            char_replace 按精确下标替换不会误伤；
+          * 必须逐字保留的原文引用：某段「…」若在对应源块(kr/jp/en)中原样出现，
+            视为原文引用，整段豁免（如引用块、需原样复现的台词内嵌引文）。
+        """
+        mapping = {"「": "“", "」": "”"}
+        violations: list[ValidationViolation] = []
+
+        # 收集原文里逐字出现的「…」片段作为豁免集合
+        verbatim_spans: set[str] = set()
+        for block in text_blocks or []:
+            for lang in ("kr", "jp", "en"):
+                src = str((block or {}).get(lang, "") or "")
+                verbatim_spans.update(m.group(0) for m in RuleBasedValidator._VERBATIM_QUOTE_RE.finditer(src))
+
+        for block_idx, cn_text in enumerate(translations):
+            # 逐块计算原文引用在译文中的覆盖区间，整段跳过
+            exempt_ranges: list[tuple[int, int]] = []
+            for span in verbatim_spans:
+                start = 0
+                while True:
+                    idx = cn_text.find(span, start)
+                    if idx < 0:
+                        break
+                    exempt_ranges.append((idx, idx + len(span)))
+                    start = idx + 1
+
+            for pos, char in enumerate(cn_text):
+                if char not in mapping:
+                    continue
+                if any(a <= pos < b for a, b in exempt_ranges):
+                    continue  # 必须逐字保留的原文引用，不触碰
+                violations.append(ValidationViolation(
+                    block_id=block_idx + 1,
+                    rule="cjk_quote",
+                    severity="error",
+                    message=f"日式直角引号'{char}'应改为'{mapping[char]}'",
+                    auto_fixable=True,
+                    fix_fn="char_replace",
+                    fix_params={
+                        "position": pos, "old": char, "new": mapping[char],
+                    },
+                ))
         return violations
 
     def validate_effect_refs(
@@ -435,3 +577,106 @@ class RuleBasedValidator:
                 ))
 
         return violations
+
+
+# ---------------------------------------------------------------------------
+# 术语落位校验（零模型，风险信号；不阻断导出，不自动改译文）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LandingObservation:
+    """单条术语在一批文本块上的落位观测。"""
+
+    term_key: str
+    term: str
+    expected_zh: str
+    landing: str          # none | applied | partial | missing
+    hit_blocks: list[int] = field(default_factory=list)
+    note: str = ""
+
+
+@dataclass
+class LandingReport:
+    """一次落位校验的聚合结果。"""
+
+    observations: list[LandingObservation] = field(default_factory=list)
+
+    def counts(self) -> dict[str, int]:
+        out = {k: 0 for k in ("none", "applied", "partial", "missing")}
+        for o in self.observations:
+            out[o.landing] = out.get(o.landing, 0) + 1
+        return out
+
+    def to_landing_records(self) -> list[dict]:
+        """转成 tools.termdb terms-landing 可消费的回流记录。"""
+        return [
+            {"term_key": o.term_key, "landing": o.landing, "note": o.note}
+            for o in self.observations
+            if o.landing != "none"
+        ]
+
+
+class TermLandingValidator:
+    """确定性落位校验器：把强制档术语在译文中的实际落位判成四态。
+
+    设计约束：
+      * 零模型、零人工审批，只产出风险信号，不改译文、不阻断导出；
+      * 单体词 / name_only / candidate 不参与正文子串判定（避免误报误伤）；
+      * 词面取自兼容视图的 ``term`` 字段（运行时唯一索引键），与
+        ProperAnalyzer / build_proper 完全同口径。
+    """
+
+    def __init__(self, proper_terms: list[dict], *, hard_only: bool = True):
+        self._registry: list[tuple[str, str, str, str]] = []
+        for t in proper_terms or []:
+            if not isinstance(t, dict):
+                continue
+            tier = str(t.get("tier", "hard"))
+            if hard_only and tier != "hard":
+                continue
+            if tier == "candidate":
+                continue
+            scope = t.get("scope") or {}
+            if scope.get("match") == "name_only":
+                continue
+            kr = str(t.get("term", "") or "")
+            zh = str(t.get("translation", "") or t.get("cn", "") or "")
+            if not (kr and zh):
+                continue
+            key = f"{t.get('entity_id', '')}|{t.get('sense', '')}"
+            self._registry.append((key, kr, zh, tier))
+        self._registry.sort(key=lambda x: (-len(x[1]), x[1]))
+
+    def check(self, text_blocks: list[dict], translations: list[str]) -> LandingReport:
+        report = LandingReport()
+        n = min(len(text_blocks), len(translations))
+        for key, kr, zh, tier in self._registry:
+            hits: list[int] = []
+            for i in range(n):
+                src = str((text_blocks[i] or {}).get("kr", "") or "")
+                if kr in src:
+                    hits.append(i + 1)
+            if not hits:
+                report.observations.append(LandingObservation(
+                    key, kr, zh, "none", note=f"tier={tier}"))
+                continue
+            applied = partial = 0
+            for idx in hits:
+                out = str(translations[idx - 1] or "")
+                if zh in out:
+                    applied += 1
+                elif len(zh) >= 2 and any(
+                    zh[j:j + 2] in out for j in range(len(zh) - 1)
+                ):
+                    partial += 1
+            if applied:
+                landing = "applied"
+            elif partial:
+                landing = "partial"
+            else:
+                landing = "missing"
+            report.observations.append(LandingObservation(
+                key, kr, zh, landing, hit_blocks=hits,
+                note=f"tier={tier};hits={len(hits)};applied={applied};partial={partial}",
+            ))
+        return report

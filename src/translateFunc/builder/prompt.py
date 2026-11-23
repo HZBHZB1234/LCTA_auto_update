@@ -26,7 +26,10 @@ class PromptTag(Enum):
     RULES      = "rules"
     RULE       = "rule"
     GLOSSARY   = "glossary"
+    HARD_TERMS = "hard_terms"
+    SOFT_TERMS = "soft_terms"
     TERM       = "term"
+    DO_NOT_APPLY = "do_not_apply"
     EXAMPLES   = "examples"
     EXAMPLE    = "example"
     IN         = "in"
@@ -64,10 +67,21 @@ class PromptFactory:
     )
 
     # 阶段 1 翻译规则 —— 按优先级排列
+    #
+    # t8：直角引号例外收紧的官方语料依据（只读引用，不改 eval 数据）：
+    #   * docs/eval/history_cases/2026111901.json 的 hv2026111901-ui-92dccb260f0f：
+    #     KR「적응」/「부적응」→ 官方中文“适应”/“不适应”（非「适应」/「不适应」）。
+    #   * tests/golden/regression_cases.json 的 RG-BAN-CJK-QUOTE：
+    #     JP「これが最後の一撃だ…！」→ 官方中文“这就是最后一击了……！”。
+    #   * 同文件 RG-BAN-CJK-QUOTE-SHORT：JP「いつか」→ 官方中文“总有一天”。
+    # 结论：原文里的「」只是引用标记，普通 zh-CN 正文必须换成全角“”；
+    # 旧文案「（原文自带除外）」过宽，会被 KR 源文自带的「적응」误触发。
     _STAGE1_RULES_DATA: list[dict] = [
         {"priority": "P0", "text": "翻译优先级：以韩文(KR)为源语言；日文(JP)和英文(EN)仅作为理解辅助参考。当KR与JP/EN语义不一致时，以KR为准"},
-        {"priority": "P0", "text": "术语一致性：先查看reference中的术语表及每条文本块的proper_refs/affect_refs/model引用，确保术语一致；术语内容可能存在错误引用，如果术语内容与原文意思偏差过大，忽略该术语"},
-        {"priority": "P1", "text": "标点符号：中文翻译必须使用全角标点（！？，。：）、中文引号（“”），禁止使用半角标点(!?,. )；禁止使用日式直角引号「」（原文自带除外）"},
+        {"priority": "P0", "text": "术语一致性：hard_terms为强制译名，必须逐字沿用（含名称后的半角空格）；soft_terms为参考译名，优先沿用但若与原文语义明显冲突可弃用；结合每条文本块的proper_refs/affect_refs/model引用判断。任何文本块出现do_not_apply时，该块严禁套用所列术语的常规译名，必须按actual_meaning给出的上下文含义翻译——这是消歧结论，优先级高于术语表"},
+        {"priority": "P0", "text": "Buff尾空格零容忍（仅正文）：状态效果/Buff的中文名出现在desc/summary/整句正文中时，其后必须保留一个半角空格（如'对攻击者施加1层烧伤 '、'充能 层数'），即使位于句尾、括号或标点之前，严禁 strip/删除该空格；但若整条文本本身只是一个状态名/标题（name/title 字段，如整块仅为'화상'），官方 name 无尾空格（如'烧伤'），禁止追加空格。按文本形态判断：整条只有一个状态名→不加；状态名嵌在句子里→保留"},
+        {"priority": "P0", "text": "输出完整性：reasoning只写一句话（不超过40字）；translation必须完整输出每个文本块的全部内容。长字段（desc/quote）不得因reasoning过长而截断、省略或输出空正文"},
+        {"priority": "P1", "text": "标点符号：中文翻译必须使用全角标点（！？，。：）、中文引号（“”），禁止使用半角标点(!?,. )；禁止使用日式直角引号「」——原文(KR/JP/EN)把词句包在「」里只是原文的引用标记，并非需要逐字保留的内容，普通翻译正文一律改用中文引号“”或直接译出该词（如 KR「적응」译为“适应”、「부적응」译为“不适应”，严禁写成「适应」/「不适应」；JP「いつか」译为“总有一天”）；仅当整段「…」本身属于必须逐字保留的原文引用（如整块引用块、需原样复现的台词内嵌引文）时才可保留「」，译文其余任何位置都不得出现「」"},
         {"priority": "P1", "text": "参数保护：原文中的尖括号参数（如<0>、<1>）是游戏代码占位符，不得破坏其格式；理解参数含义后按中文语序放置到语法正确的位置"},
         {"priority": "P2", "text": "省略号：剧情文本使用六点省略号……；技能/UI紧凑文本使用三点省略号…。原文为长省略号时对齐长度"},
         {"priority": "P2", "text": "波浪号：使用半角波浪号~，不得从原文复制全角波浪号～（游戏字库缺字会导致显示异常）"},
@@ -95,7 +109,7 @@ class PromptFactory:
     _STAGE0_RULES_DATA: list[dict] = [
         {"priority": "P0", "text": "你的任务是判断术语在当前上下文中是否适用，不需要翻译"},
         {"priority": "P0", "text": "对比术语的典型使用场景和当前文本块的JP/EN内容"},
-        {"priority": "P1", "text": "如果术语明显不适用（如人名术语出现在技能描述中），标记为不适用"},
+        {"priority": "P1", "text": "如果术语明显不适用（如人名术语出现在技能描述中），标记applies=false，并在actual_meaning中写明该词在此上下文的真实含义（如'사색是四色的构词成分，并非地支巳'）；该结论会作为块级do_not_apply硬约束下发给翻译阶段，务必准确"},
     ]
 
     # 阶段 2 规则 —— 按优先级排列
@@ -131,15 +145,44 @@ class PromptFactory:
         ],
         "SKILL": [
             {"priority": "P0", "text": "方括号[]内的内容为游戏引擎代码标识符（如[OnSucceedAttack]、[BeforeAttack]、[SuperCoin]），必须原样保留英文，严禁将内部翻译成中文或韩文，禁止生成[中文名]形式（如[出血]、[震颤]）；正文中的状态效果应使用术语表中的中文名称（如'烧伤 强度'、'充能 层数'，名称后带半角空格），不得在正文中保留状态效果的英文ID"},
-            {"priority": "P1", "text": "Buff名称空格：所有Buff/状态效果的中文名称翻译后应跟一个半角空格（如'震颤 '），即使位于句尾或标点前也不可省略此空格。示例：'施加2层震颤 。'正确，'施加2层震颤。'错误。除非位于[]中"},
+            {"priority": "P1", "text": "Buff名称空格（仅正文）：Buff/状态效果中文名嵌在desc/summary/整句中时，后面必须跟一个半角空格（如'震颤 '），即使位于句尾或标点前也不可省略。示例：'施加2层震颤 。'正确，'施加2层震颤。'错误。整条仅为状态名的name/title字段不加空格（如'烧伤'，不是'烧伤 '）。除非位于[]中"},
             {"priority": "P1", "text": "技能/硬币위력→威力：'코인 위력'译为'硬币威力'，'스킬 위력'译为'本技能威力'，不得译作'强度'"},
             {"priority": "P1", "text": "状态效果위력→强度、횟수→层数：写作'Buff名 强度'/'Buff名 层数'（如'烧伤 强度'、'充能 层数'，名称后带半角空格）"},
+            {"priority": "P1", "text": "官方措辞：KR'충전 횟수'写作'充能 层数'（不得写'充能次数'或'充电 回数'）；'코인 위력이 1이 됨'写作'硬币威力固定为1'（不得写'硬币威力变为1'或'硬币威力 固定为1'）"},
             {"priority": "P1", "text": "技能描述紧凑：技能效果描述需精炼，Buff/Debuff名称遵循术语表约定"},
         ],
         "UI": [
             {"priority": "P1", "text": "UI标签简洁：按钮/标签文本尽量简短，不加句号等多余标点"},
         ],
     }
+
+    # 风格硬约束 few-shot：不依赖 examples.py，缺省也保证模型看到反 strip / 官方措辞示范。
+    _BUILTIN_STYLE_EXAMPLES: list[dict] = [
+        {
+            "in": "KR: 화상",
+            "reasoning": "整条仅为状态名（name 字段），官方名为'烧伤'，不得追加尾空格。",
+            "translation": "烧伤",
+            "confidence": "high",
+        },
+        {
+            "in": "KR: 화상 횟수 1 증가",
+            "reasoning": "状态名'烧伤'嵌在整句中（summary 字段），后保留半角空格，句尾也不得 strip。",
+            "translation": "对攻击者施加1层烧伤 ",
+            "confidence": "high",
+        },
+        {
+            "in": "KR: 충전 횟수 1 증가",
+            "reasoning": "'충전 횟수'按官方写法为'充能 层数'，状态名后保留半角空格。",
+            "translation": "充能 层数额外+1层",
+            "confidence": "high",
+        },
+        {
+            "in": "KR: 코인 위력이 1이 됨",
+            "reasoning": "硬币威力用'威力'，官方措辞为'固定为1'而非'变为1'。",
+            "translation": "硬币威力固定为1",
+            "confidence": "high",
+        },
+    ]
 
     # ---- 输出格式规范（xml_json 模式：XML 包裹的 JSON 响应描述） ----
 
@@ -556,11 +599,17 @@ class PromptFactory:
                 parts.append(self._render_format_rules(format_rules, is_json=is_json))
 
         # 4. Examples（仅 full 档：few-shot 很长，降级重试时反而是噪音）
-        if verbosity == self.VERBOSITY_FULL and examples:
-            if is_json:
-                parts.append(self._render_examples_json(examples))
-            else:
-                parts.append(self._render_examples(examples))
+        #    内置风格示范（反 strip / 官方措辞）始终随 full 档下发，避免外部
+        #    examples 缺省或被裁剪时丢失这些硬约束的具体样例。
+        if verbosity == self.VERBOSITY_FULL:
+            merged_examples = list(self._BUILTIN_STYLE_EXAMPLES)
+            if examples:
+                merged_examples.extend(examples)
+            if merged_examples:
+                if is_json:
+                    parts.append(self._render_examples_json(merged_examples))
+                else:
+                    parts.append(self._render_examples(merged_examples))
 
         # 5. Output Format (last, as concrete instruction)
         if stage == 1 and verbosity == self.VERBOSITY_MINIMAL:
@@ -671,6 +720,9 @@ class PromptFactory:
                 lines.append(f"    <jp>{self._xml_escape(block.get('jp', ''))}</jp>")
             if block.get('en'):
                 lines.append(f"    <en>{self._xml_escape(block.get('en', ''))}</en>")
+            # 长字段分节投递：压低 reasoning 预算，保证译文完整
+            if len(str(block.get('kr', ''))) >= self.LONG_FIELD_CHARS:
+                lines.append(f"    <output_hint>{self.LONG_FIELD_HINT}</output_hint>")
             # Per-block 引用字段
             if block.get('proper_refs'):
                 refs = ", ".join(block['proper_refs'])
@@ -680,26 +732,95 @@ class PromptFactory:
                 lines.append(f"    <affect_refs>{self._xml_escape(refs)}</affect_refs>")
             if block.get('model'):
                 lines.append(f"    <model>{self._xml_escape(block['model'])}</model>")
+            # 消歧结论：块级负向约束（与术语表解耦，绝不被 term 过滤删除）
+            if block.get('do_not_apply'):
+                lines.append("    <do_not_apply>")
+                for item in block['do_not_apply']:
+                    lines.append("      <item>")
+                    lines.append(f"        <term>{self._xml_escape(str(item.get('term', '')))}</term>")
+                    if item.get('cn'):
+                        lines.append(f"        <usual_cn>{self._xml_escape(str(item['cn']))}</usual_cn>")
+                    if item.get('actual_meaning'):
+                        lines.append(
+                            f"        <actual_meaning>{self._xml_escape(str(item['actual_meaning']))}</actual_meaning>"
+                        )
+                    if item.get('reason'):
+                        lines.append(f"        <reason>{self._xml_escape(str(item['reason']))}</reason>")
+                    lines.append("      </item>")
+                lines.append("    </do_not_apply>")
             lines.append(f"  </block>")
         lines.append("</text>")
         return "\n".join(lines) + "\n"
 
+    # 长字段（desc/quote）分节投递：给模型显式的输出预算提示。
+    # reasoning 过长会吃光 max_tokens 导致 translation 空正文；此处压低其长度。
+    LONG_FIELD_CHARS = 80
+    LONG_FIELD_HINT = "长字段：reasoning限一句话，translation必须完整输出全文，禁止截断或空正文"
+
+    # tier → 渲染分节。candidate（模型新词 / L2 / L3）只在候选池，不进请求。
+    _GLOSSARY_SECTIONS = (
+        ("hard", "hard_terms", "强制译名：必须逐字沿用，不得改写或替换（含尾随半角空格）"),
+        ("soft", "soft_terms", "参考译名：优先沿用；与原文语义明显冲突时可弃用"),
+    )
+
+    @classmethod
+    def _glossary_tier(cls, term: dict) -> str:
+        """词条档位；无 tier 的旧条目按 hard 处理，保持向后兼容。
+
+        防御性收口：stale 证据与 name_only 作用域的条目即使被上游误标为 hard，
+        也一律降为 soft——它们绝不能进强制译名区。
+        """
+        tier = str(term.get("tier", "hard")).lower()
+        if tier not in ("hard", "soft", "candidate"):
+            tier = "hard"
+        if tier == "candidate":
+            return "candidate"
+        if bool(term.get("stale")):
+            return "soft"
+        if str((term.get("scope") or {}).get("match", "")) == "name_only":
+            return "soft"
+        return tier
+
+    @classmethod
+    def _is_editorial_note(cls, note: str) -> bool:
+        """过滤 termdb 机器元数据注记（termdb:hard|... 哈希串），只留人工可读注记。"""
+        return bool(note) and not str(note).startswith("termdb:")
+
     def render_glossary(self, terms: list[dict]) -> str:
-        """渲染 <glossary> 节。术语为空时省略。"""
-        if not terms:
+        """按 hard/soft 分节渲染术语区；candidate 不进请求。
+
+        兼容 ``{term, translation}`` 老条目：kr/cn 走既有回退逻辑
+        （``kr`` 缺失回退 ``term``，``cn`` 缺失回退 ``translation``）。
+        """
+        buckets: dict[str, list[dict]] = {"hard": [], "soft": []}
+        for t in terms or []:
+            if not isinstance(t, dict):
+                continue
+            tier = self._glossary_tier(t)
+            if tier == "candidate":
+                continue
+            buckets[tier].append(t)
+        if not buckets["hard"] and not buckets["soft"]:
             return ""
-        lines = ["<glossary>"]
-        for t in terms:
-            kr = self._xml_escape(t.get('kr', t.get('term', '')))
-            cn = self._xml_escape(t.get('cn', t.get('translation', '')))
-            note = self._xml_escape(t.get('note', ''))
-            lines.append("  <term>")
-            lines.append(f"    <kr>{kr}</kr>")
-            lines.append(f"    <cn>{cn}</cn>")
-            if t.get('note'):
-                lines.append(f"    <note>{note}</note>")
-            lines.append("  </term>")
-        lines.append("</glossary>")
+
+        lines: list[str] = []
+        for tier, tag, hint in self._GLOSSARY_SECTIONS:
+            group = buckets[tier]
+            if not group:
+                continue
+            lines.append(f"<{tag}>")
+            lines.append(f"  <!-- {hint} -->")
+            for t in group:
+                kr = self._xml_escape(t.get('kr', t.get('term', '')))
+                cn = self._xml_escape(t.get('cn', t.get('translation', '')))
+                lines.append("  <term>")
+                lines.append(f"    <kr>{kr}</kr>")
+                lines.append(f"    <cn>{cn}</cn>")
+                note = t.get('note', '')
+                if self._is_editorial_note(note):
+                    lines.append(f"    <note>{self._xml_escape(note)}</note>")
+                lines.append("  </term>")
+            lines.append(f"</{tag}>")
         return "\n".join(lines) + "\n"
 
     def render_text_blocks_json(self, text_blocks: list[dict]) -> str:
@@ -712,6 +833,8 @@ class PromptFactory:
                 item["jp"] = block["jp"]
             if block.get("en"):
                 item["en"] = block["en"]
+            if len(str(block.get("kr", ""))) >= self.LONG_FIELD_CHARS:
+                item["output_hint"] = self.LONG_FIELD_HINT
             # Per-block 引用字段
             if block.get("proper_refs"):
                 item["proper_refs"] = block["proper_refs"]
@@ -719,23 +842,37 @@ class PromptFactory:
                 item["affect_refs"] = block["affect_refs"]
             if block.get("model"):
                 item["model"] = block["model"]
+            # 消歧结论：块级负向约束
+            if block.get("do_not_apply"):
+                item["do_not_apply"] = block["do_not_apply"]
             items.append(item)
         return _json.dumps({"text_blocks": items}, ensure_ascii=False, indent=2) + "\n"
 
     def render_glossary_json(self, terms: list[dict]) -> str:
-        """渲染 glossary 为 JSON 字符串。术语为空时省略。"""
+        """渲染 glossary 为 JSON 字符串。术语为空时省略。
+
+        保留 ``{"glossary": [...]}`` 的既有结构（旧调用方契约）；
+        条目附 tier 便于区分强制/参考，candidate 不进请求。
+        """
         if not terms:
             return ""
         import json as _json
         items = []
         for t in terms:
+            if not isinstance(t, dict):
+                continue
+            tier = self._glossary_tier(t)
+            if tier == "candidate":
+                continue
             kr = t.get("kr", t.get("term", ""))
             cn = t.get("cn", t.get("translation", ""))
             note = t.get("note", "")
-            entry = {"kr": kr, "cn": cn}
-            if note:
+            entry = {"kr": kr, "cn": cn, "tier": tier}
+            if self._is_editorial_note(note):
                 entry["note"] = note
             items.append(entry)
+        if not items:
+            return ""
         return _json.dumps({"glossary": items}, ensure_ascii=False, indent=2) + "\n"
 
     def _render_examples_json(self, examples: list[dict]) -> str:

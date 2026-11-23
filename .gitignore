@@ -13,8 +13,22 @@ update.md
 .pytest_cache/
 tools/steamCmd
 lcta-diagnostics-*
-benchmark
+# benchmark 全部为本地评测/测试产物，不入库（含 bench_config.yaml 的真实 key）
+benchmark/
 proper_learned.json
 .workbuddy
 LocalizeLimbusCompany
+LimbusLocalizeAchieve
 docs/translation-consistency-designs
+# AgentTeams 会话状态（含内部消息与归档），属运行时数据不入库
+.agent-teams/
+# 术语库/评测/回放等生成产物与测试产物，仅保留本地
+_diag_analysis/
+docs/eval/
+docs/termdb/
+docs/lcta-v2-plan/
+docs/2026-11-15-glossary-selfbuild-plan.md
+tests/golden/
+tests/test_golden_regression.py
+tests/test_prompt_sections.py
+tests/test_termdb_terms.py

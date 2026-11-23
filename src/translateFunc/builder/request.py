@@ -83,6 +83,9 @@ class RequestBuilder:
                     for m in match_result.proper_matches:
                         if m.data:
                             term_data = m.data if isinstance(m.data, dict) else {"term": m.pattern}
+                            # 候选档（模型新词 / L2 / L3）只在候选池，不进术语区
+                            if str(term_data.get("tier", "hard")) == "candidate":
+                                continue
                             term_key = term_data.get("term", m.pattern)
                             if term_key not in all_proper_terms:
                                 all_proper_terms[term_key] = term_data
@@ -468,19 +471,29 @@ class RequestBuilder:
 
         output: dict = {}
 
-        # Glossary
-        proper_terms = reference.get("proper_terms", [])
-        if proper_terms:
-            glossary = []
-            for t in proper_terms:
-                kr = t.get("kr", t.get("term", ""))
-                cn = t.get("cn", t.get("translation", ""))
-                note = t.get("note", "")
-                entry = {"kr": kr, "cn": cn}
-                if note:
-                    entry["note"] = note
-                glossary.append(entry)
-            output["glossary"] = glossary
+        # Glossary —— 按 hard/soft 分节；candidate 不进请求。
+        # 兼容 {term, translation} 老条目：kr/cn 走与 XML 渲染一致的回退。
+        from translateFunc.builder.prompt import PromptFactory
+        pf = PromptFactory()
+        buckets: dict[str, list[dict]] = {"hard": [], "soft": []}
+        for t in reference.get("proper_terms", []) or []:
+            if not isinstance(t, dict):
+                continue
+            tier = pf._glossary_tier(t)
+            if tier == "candidate":
+                continue
+            entry = {
+                "kr": t.get("kr", t.get("term", "")),
+                "cn": t.get("cn", t.get("translation", "")),
+            }
+            note = t.get("note", "")
+            if pf._is_editorial_note(note):
+                entry["note"] = note
+            buckets[tier].append(entry)
+        if buckets["hard"]:
+            output["hard_terms"] = buckets["hard"]
+        if buckets["soft"]:
+            output["soft_terms"] = buckets["soft"]
 
         # Affects
         if reference.get("affects"):
@@ -502,6 +515,9 @@ class RequestBuilder:
                 item["jp"] = block["jp"]
             if block.get("en"):
                 item["en"] = block["en"]
+            # 长字段分节投递：压低 reasoning 预算，避免空正文
+            if len(str(block.get("kr", ""))) >= pf.LONG_FIELD_CHARS:
+                item["output_hint"] = pf.LONG_FIELD_HINT
             # Per-block 引用字段
             if block.get("proper_refs"):
                 item["proper_refs"] = block["proper_refs"]
@@ -509,6 +525,9 @@ class RequestBuilder:
                 item["affect_refs"] = block["affect_refs"]
             if block.get("model"):
                 item["model"] = block["model"]
+            # 消歧结论：块级负向约束（新承载字段，与会被 term 过滤的 proper_terms 解耦）
+            if block.get("do_not_apply"):
+                item["do_not_apply"] = block["do_not_apply"]
             items.append(item)
         output["text_blocks"] = items
 

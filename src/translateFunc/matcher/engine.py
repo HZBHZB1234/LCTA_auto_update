@@ -54,6 +54,9 @@ class MatcherEngine:
         with self._proper_lock:
             self._proper_data = {}
             for item in proper_terms:
+                # candidate 只在候选池，绝不进 AC 匹配（防御性收口）
+                if str(item.get("tier", "hard")) == "candidate":
+                    continue
                 term = item.get("term", "")
                 if term and term not in self._proper_data:
                     self._proper_data[term] = item
@@ -90,6 +93,20 @@ class MatcherEngine:
         """当前术语表快照（term -> 词条）。"""
         with self._proper_lock:
             return dict(self._proper_data)
+
+    def proper_terms_by_tier(self, tier: str = "hard") -> dict[str, dict]:
+        """按 tier 取快照；旧词条无 tier 字段时视为 hard（向后兼容）。"""
+        return {k: v for k, v in self.proper_terms.items()
+                if str(v.get("tier", "hard")) == tier}
+
+    def landing_terms(self) -> dict[str, dict]:
+        """可进翻译术语区的词条（hard + soft）。
+
+        candidate 档（模型新词 / L2 / L3）只在候选池，不进提示词强制区。
+        旧词条无 tier 字段时默认 hard，保持旧行为。
+        """
+        return {k: v for k, v in self.proper_terms.items()
+                if str(v.get("tier", "hard")) in ("hard", "soft")}
 
     def build_roles(self, role_items: list[dict]) -> None:
         """从 [{id, kr, cn, nickName}, ...] 构建角色 AC 自动机。

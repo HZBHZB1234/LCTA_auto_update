@@ -21,12 +21,23 @@ from translateFunc.proper.analyze import extract_contexts
 
 @dataclass
 class ProperTerm:
-    """经 JP/EN 交叉验证数据增强的专有名词术语。"""
+    """经 JP/EN 交叉验证数据增强的专有名词术语。
+
+    tier/state/scope/stale 必须贯穿到运行时字典，否则 hard/soft/candidate
+    分层会在 analyze() → proper_dicts 之间丢失，导致 stale 软词被当强制译名。
+    """
     kr: str
     cn: str
     note: str = ""
     positive_contexts: list[dict] = field(default_factory=list)
     negative_contexts: list[dict] = field(default_factory=list)
+    # tier 是 prompt/request 唯一识别的顶层键；无 tier 的旧条目按 hard 兼容
+    tier: str = "hard"
+    state: str = "active"
+    scope: dict = field(default_factory=dict)
+    stale: bool = False
+    entity_id: str = ""
+    sense: str = ""
 
     @property
     def is_short(self) -> bool:
@@ -36,6 +47,26 @@ class ProperTerm:
     @property
     def has_contexts(self) -> bool:
         return len(self.positive_contexts) > 0
+
+    def to_runtime_dict(self) -> dict:
+        """转成 engine / prompt 消费的运行时词条（顶层 tier 必带）。
+
+        同时镜像 kr/cn，保证 render_glossary 与 render_glossary_json 的
+        回退路径都拿到正确词面（旧代码只认 term，绝不能丢）。
+        """
+        return {
+            "term": self.kr,
+            "kr": self.kr,
+            "translation": self.cn,
+            "cn": self.cn,
+            "note": self.note,
+            "tier": self.tier,
+            "state": self.state,
+            "scope": dict(self.scope),
+            "stale": self.stale,
+            "entity_id": self.entity_id,
+            "sense": self.sense,
+        }
 
 
 class ProperAnalyzer:
@@ -98,6 +129,12 @@ class ProperAnalyzer:
                 cn=cn,
                 note=note,
                 positive_contexts=positive_contexts,
+                tier=str(item.get("tier", "hard") or "hard"),
+                state=str(item.get("state", "active") or "active"),
+                scope=item.get("scope") or {},
+                stale=bool(item.get("stale", False)),
+                entity_id=str(item.get("entity_id", "") or ""),
+                sense=str(item.get("sense", item.get("sense_id", "")) or ""),
             )
             terms.append(term)
 

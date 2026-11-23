@@ -142,12 +142,24 @@ class TranslationPipeline:
 
                 with profiler.phase("专有名词分析"):
                     proper_terms = self._analyzer.analyze(raw_terms)
+                    # 顶层 tier/state/scope/stale 必须透传：prompt/request 只认顶层 tier，
+                    # 丢失后全部旧条目会被当成 hard，stale 软词将被当强制译名。
+                    proper_dicts = [t.to_runtime_dict() for t in proper_terms]
+                    # candidate（模型新词 / L2 / L3）不进 AC 匹配，只在候选池
                     proper_dicts = [
-                        {"term": t.kr, "translation": t.cn, "note": t.note}
-                        for t in proper_terms
+                        d for d in proper_dicts
+                        if str(d.get("tier", "hard")) != "candidate"
                     ]
                     self._engine.build_proper(proper_dicts)
-                self._log_bridge.info(f"已加载 {len(proper_terms)} 个专有名词")
+                from collections import Counter as _Counter
+                tier_counts = _Counter(t.tier for t in proper_terms)
+                self._log_bridge.info(
+                    f"已加载 {len(proper_dicts)} 个专有名词（"
+                    f"hard={tier_counts.get('hard', 0)}, "
+                    f"soft={tier_counts.get('soft', 0)}, "
+                    f"candidate过滤={tier_counts.get('candidate', 0)}, "
+                    f"stale={sum(1 for t in proper_terms if t.stale)}）"
+                )
             else:
                 self._log_bridge.info("专有名词分析已跳过（enable_proper=False）")
 
@@ -246,6 +258,33 @@ class TranslationPipeline:
 
         for o in outcomes:
             self._record_outcome(o, summary)
+
+        # 8.4 落位自动回流：零人工 CLI 的自动矫正闭环。
+        #     用本轮已保存的译文与 KR 源文按结构路径配对，跑 hard 档四态落位校验，
+        #     回流状态机（失败计数/降级/衰减）并重导出兼容视图。
+        #     这是附加产出：任何异常只记 debug，绝不影响翻译主流程。
+        if self._config.enable_proper and self._engine.proper_terms:
+            try:
+                from tools.termdb import terms_feedback  # noqa: WPS433
+                saved_pairs: list[tuple[Path, Path]] = []
+                for src in target_files:
+                    fpc = FilePathConfig(
+                        KR_path=src, _PathConfig=base_path_config, has_prefix=has_prefix,
+                    )
+                    if fpc.target_file.is_file():
+                        saved_pairs.append((src, fpc.target_file))
+                feedback = terms_feedback.run_pipeline_feedback(
+                    Path(__file__).resolve().parents[2],
+                    saved_pairs,
+                    list(self._engine.landing_terms().values()),
+                )
+                if feedback.get("landing_records"):
+                    self._log_bridge.info(
+                        f"落位自动回流：观测 {feedback['landing_records']} 条，"
+                        f"状态变更 {feedback.get('state_changes', 0)} 条"
+                    )
+            except Exception as exc:  # noqa: BLE001 - 附加产出不影响主流程
+                _logger.debug(f"落位自动回流跳过：{type(exc).__name__}: {exc}")
 
         # 8. 新专有名词落盘（下次运行启动时合并进术语表）
         if self._new_term_collector is not None:

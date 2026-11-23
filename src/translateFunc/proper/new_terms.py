@@ -14,6 +14,10 @@ LLM 在阶段 1 的响应里附带 ``new_terms``（原文中出现、但 glossar
 落盘文件中 ``terms`` 数组的 ``term``/``translation``/``note`` 三个字段与
 ``ProperAnalyzer.fetch_terms(proper_path=...)`` 的 schema 一致，因此这个文件
 本身就可以直接当 ``proper_path`` 使用。
+
+自维护语义：回传新词只标 ``tier=state=candidate``，进 L3 候选池；
+``MatcherEngine.landing_terms()`` 会把它挡在翻译强制区之外，
+只有经 termdb 证据链确认的新版官方名称才能进 hard/soft。
 """
 from __future__ import annotations
 
@@ -215,8 +219,13 @@ class NewTermCollector:
         meta = self._meta.get(key, {})
         return {
             "term": key[0],
+            "kr": key[0],
             "translation": key[1],
+            "cn": key[1],
             "note": NOTE_TAG,
+            # 模型回传词永远只是候选：不进 hard/soft 强制区，无人工审批入口
+            "tier": "candidate",
+            "state": "candidate",
             "category": meta.get("category", "other"),
             "votes": self._votes.get(key, 1),
             "sources": list(meta.get("sources", [])),
@@ -293,8 +302,12 @@ def merge_terms(base: list[dict], learned: list[dict]) -> tuple[list[dict], dict
             continue
         merged.append({
             "term": term,
+            "kr": term,
             "translation": translation,
+            "cn": translation,
             "note": _clean(item.get("note", "")) or NOTE_TAG,
+            "tier": "candidate",   # 本地建议永不覆盖权威 hard 档
+            "state": "candidate",
         })
         existing.add(term)
         added += 1

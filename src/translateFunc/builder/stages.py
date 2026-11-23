@@ -255,6 +255,20 @@ class StageStrategy:
                 parts.append(f"    <affect_refs>{_xml_escape(refs)}</affect_refs>")
             if orig.get('model'):
                 parts.append(f"    <model>{_xml_escape(orig['model'])}</model>")
+            # 消歧结论：块级负向约束，校验时必须尊重（防止自校验把更正又改回去）
+            if orig.get('do_not_apply'):
+                parts.append("    <do_not_apply>")
+                for item in orig['do_not_apply']:
+                    parts.append("      <item>")
+                    parts.append(f"        <term>{_xml_escape(str(item.get('term', '')))}</term>")
+                    if item.get('actual_meaning'):
+                        parts.append(
+                            f"        <actual_meaning>{_xml_escape(str(item['actual_meaning']))}</actual_meaning>"
+                        )
+                    if item.get('reason'):
+                        parts.append(f"        <reason>{_xml_escape(str(item['reason']))}</reason>")
+                    parts.append("      </item>")
+                parts.append("    </do_not_apply>")
             trans_text = trans.get("translation", "") if isinstance(trans, dict) else str(trans)
             parts.append(f"    <translation>{_xml_escape(trans_text)}</translation>")
             parts.append(f"  </pair>")
