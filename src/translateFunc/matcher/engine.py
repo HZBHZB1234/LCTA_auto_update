@@ -11,14 +11,6 @@ from translateFunc.matcher.ac_automaton import AcAutomaton, ACPattern
 # 名称类字段：scope.match=name_only 只允许在这些字段命中
 NAME_FIELDS = frozenset({"name", "teller", "title", "keyword", "summary"})
 
-# 「短词面」阈值。域门只拦 ≤2 字纯韩文（기사/두려움/흰색 这类同形高危词），
-# 3 字及以上即便跨域也放行——가시춘(贾惜春) 这类人名常挂在 ui_or_data，
-# 若按域硬拦，剧情正文就永远拿不到官方译名（审查实测 M1/M2 同类误杀）。
-DOMAIN_GATE_MAX_LEN = 2
-# 软档短词面不进非名称字段的上限（比域门宽一档：검정색/노란색 等颜色标签
-# 是 3 字软词，必须挡住，否则「검정색 연기」会被提示成「哀叹」）。
-SOFT_PROSE_MAX_LEN = 3
-
 
 def _is_hangul(ch: str) -> bool:
     code = ord(ch)
@@ -33,49 +25,64 @@ def is_pure_hangul(text: str) -> bool:
     return bool(text) and all(_is_hangul(ch) for ch in text)
 
 
-def is_short_surface(text: str, max_len: int) -> bool:
-    """纯韩文且不超过 max_len 的词面——同形碰撞的高危区。"""
-    return bool(text) and len(text) <= max_len and is_pure_hangul(text)
+def _field_matches(scope_fields: list[str], field: str) -> bool:
+    """作用域字段匹配：兼容 ``desc`` 与点路径 ``dataList.#56.desc``。
+
+    term-v1 的 exact_sentence 词条把 fields 存成点路径（含 ``#N`` 占位），
+    运行时只拿得到末段字段名；直接字符串比较会让 7 条官方整句永久失效。
+    """
+    if not scope_fields or not field:
+        return True
+    for entry in scope_fields:
+        if entry == field:
+            return True
+        parts = [p for p in str(entry).replace("[", ".").replace("]", "").split(".") if p]
+        if field in parts:
+            return True
+    return False
 
 
 def scope_allows(item: dict, *, domain: str = "", field: str = "") -> bool:
-    """判断词条作用域是否允许在当前 (domain, field) 命中。
+    """判断词条作用域是否允许在当前 ``field`` 命中。
 
-    术语库的 scope 是元数据，历史上从未在运行时执行，导致字段/域受限词条
-    （如仅 title 的 기사→司机）泄漏到正文。这里统一收口：
+    只执行**能够可靠判定**的两类约束：
 
-      * domains：**只对 ≤2 字纯韩文词面硬拦**。长词面同形歧义低，若也硬拦，
-        会让 95% 非 story 域的人名在剧情正文里彻底失效（格里高尔/猩红视线）；
-      * match=name_only：只允许名称类字段；
-      * match=entity_bound/exact_sentence：有 fields 时按字段强制；
-      * match=unbound：软档短词面（≤3）不进非名称字段。
+      * ``match=name_only``：仅名称类字段可见（草稿/补丁阶段把 title-only 词条
+        降为 name_only，从而挡住 기사→司机、지도→地图 这类只在标题成立的译名）；
+      * ``match=entity_bound/exact_sentence``：按 fields（含点路径）限制字段。
+
+    **不做按词面长度或语料域的硬拦**：实测域门会挡掉 480 条/65,563 次命中，
+    其中包含 이상→李箱、료슈→良秀、홍루→鸿璐、로쟈→罗佳 四位主角的官方译名；
+    软短词规则则挡掉 단테→但丁、출혈/화상 等 409 条/33,951 次。术语表是
+    连贯性资产，宁可少拦，也不能系统性地把人名和状态名从正文里清空。
+
+    ``domain`` 保留在签名里供调用方/测试使用，当前不参与判定。
     """
     scope = item.get("scope") or {}
     if not isinstance(scope, dict) or not scope:
         return True
 
     match = str(scope.get("match") or "")
-    domains = [str(x) for x in (scope.get("domains") or []) if x]
     fields = [str(x) for x in (scope.get("fields") or []) if x]
-    kr = str(item.get("term") or item.get("kr") or "")
 
-    if (
-        domain and domains and domain not in domains
-        and is_short_surface(kr, DOMAIN_GATE_MAX_LEN)
-    ):
-        return False
+    # 字段严格化（构建期写入）：只在这些字段可见。与 match 正交，
+    # 不会因为限定字段而把硬档降成软档。
+    if scope.get("field_strict"):
+        return _field_matches(fields, field)
+
     if match == "name_only":
         return field in NAME_FIELDS if field else True
     if match in ("entity_bound", "exact_sentence"):
-        return (not fields) or (not field) or (field in fields)
-    if match == "unbound" and field and field not in NAME_FIELDS:
-        tier = str(item.get("tier", "hard"))
-        if tier == "soft" and is_short_surface(kr, SOFT_PROSE_MAX_LEN):
-            return False
+        return _field_matches(fields, field)
     return True
 
 
 def _filter_by_scope(matches: list[ACPattern], domain: str, field: str) -> list[ACPattern]:
+    """兼容保留：对已匹配结果做 scope 过滤。
+
+    新代码路径用 ``MatcherEngine._search_proper`` 在**去重叠之前**过滤，
+    避免被挡掉的长词先占位、吞掉合法短词（审查 F7）。
+    """
     if not domain and not field:
         return matches
     return [
@@ -223,6 +230,20 @@ class MatcherEngine:
 
     # ----- 匹配 -----
 
+    def _pattern_allows(self, pat: ACPattern, domain: str, field: str) -> bool:
+        item = self._proper_data.get(pat.pattern)
+        if not isinstance(item, dict):
+            return True
+        return scope_allows(item, domain=domain, field=field)
+
+    def _search_proper(self, text: str, domain: str, field: str) -> list[ACPattern]:
+        """术语匹配：先按 scope 过滤，再做最长匹配去重叠（顺序不可颠倒）。"""
+        if not domain and not field:
+            return self._proper_ac.search_non_overlapping(text)
+        return self._proper_ac.search_non_overlapping(
+            text, allow=lambda pat: self._pattern_allows(pat, domain, field),
+        )
+
     def match_all(
         self,
         text: str,
@@ -235,16 +256,14 @@ class MatcherEngine:
         """对文本运行全部匹配器，并用 JP/EN 参考过滤韩文名称误匹配。
 
         ``domain`` / ``field`` 用于执行词条作用域（scope）：不满足的词条
-        不会进入 proper_refs，从源头阻断跨域/跨字段的术语误用。
+        不会进入 proper_refs，从源头阻断跨字段的术语误用。
         """
         affect_name_matches = [
             match for match in self._affect_name_ac.search(text)
             if self._is_affect_name_supported(match.data, text, jp_text, en_text)
         ]
         return MatchResult(
-            proper_matches=_filter_by_scope(
-                self._proper_ac.search_non_overlapping(text), domain, field,
-            ),
+            proper_matches=self._search_proper(text, domain, field),
             role_matches=self._role_ac.search(text),
             affect_id_matches=self._affect_id_ac.search(text),
             affect_name_matches=affect_name_matches,
@@ -275,10 +294,8 @@ class MatcherEngine:
     def match_proper(
         self, text: str, *, domain: str = "", field: str = "",
     ) -> list[ACPattern]:
-        """仅匹配专有名词（最长匹配优先 + 作用域过滤）。"""
-        return _filter_by_scope(
-            self._proper_ac.search_non_overlapping(text), domain, field,
-        )
+        """仅匹配专有名词（scope 过滤在前，最长匹配去重叠在后）。"""
+        return self._search_proper(text, domain, field)
 
     # ----- 访问器 -----
 

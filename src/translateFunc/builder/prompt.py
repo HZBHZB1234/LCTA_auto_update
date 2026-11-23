@@ -780,8 +780,12 @@ class PromptFactory:
         if tier == "candidate":
             return "candidate"
         cn = str(term.get("cn") or term.get("translation") or "")
-        if "/" in cn or "／" in cn:
-            return "candidate"
+        try:
+            from translateFunc.termdb.terms_schema import is_multi_name_translation
+            if is_multi_name_translation(cn):
+                return "candidate"
+        except Exception:  # noqa: BLE001 - 判定失败时按普通词条处理
+            pass
         if bool(term.get("stale")):
             return "soft"
         if str((term.get("scope") or {}).get("match", "")) == "name_only":

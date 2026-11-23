@@ -39,6 +39,13 @@ SUCCESS_CALL_STATUSES = {"success", "recovered"}
 # 置信度排序：低于 min_confidence 的条目回退，并纳入降级重试
 _CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 
+# Jev 消歧返回的 choice 常是「判定标签」而非上下文含义；这类值不能当
+# actual_meaning 下发（P0 规则要求按 actual_meaning 翻译，收到标签即污染）。
+_JEV_NON_MEANING = {
+    "not_applicable", "not-applicable", "not applicable", "n/a", "na",
+    "unknown", "none", "null", "applicable", "true", "false",
+}
+
 # 韩文（Hangul）码位：谚文音节 + 字母 + 兼容字母。
 # 用于识别「模型把待翻译的韩文原文原样回填」这种最典型的漏翻。
 _RE_HANGUL = re.compile(r"[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]")
@@ -2450,11 +2457,11 @@ class FileProcessor:
         removed_refs: dict[int, dict[str, str]] = {}
         for (block_idx, term), chosen in excluded.items():
             meaning = str(chosen or "").strip()
-            # 无实际含义时不写 do_not_apply、也不移除引用：空 actual_meaning
-            # 与 P0 规则「按 actual_meaning 翻译」矛盾，且强删引用会让模型
-            # 在无任何提示下自由发挥（碰撞场景还会连带误伤长词）。
-            if not meaning:
-                continue
+            if meaning.lower() in _JEV_NON_MEANING:
+                # Jev 的 choice 是判定标签（not_applicable/applicable），
+                # 不是上下文含义：照旧移除该处引用，但绝不把标签当
+                # actual_meaning 下发（P0 规则要求按 actual_meaning 翻译）。
+                meaning = ""
             if 0 <= block_idx < len(text_blocks):
                 removed_refs.setdefault(block_idx, {})[term] = meaning
         if not removed_refs:
@@ -2467,12 +2474,14 @@ class FileProcessor:
             for term, meaning in terms.items():
                 if any(m.get("term") == term for m in markers):
                     continue
-                markers.append({
+                marker = {
                     "term": term,
                     "cn": cn_by_term.get(term, ""),
-                    "actual_meaning": meaning,
                     "reason": "Jev 逐位置判定该词在此处不适用",
-                })
+                }
+                if meaning:
+                    marker["actual_meaning"] = meaning
+                markers.append(marker)
             refs = block.get("proper_refs", [])
             kept = [r for r in refs if r not in terms]
             if len(kept) != len(refs):

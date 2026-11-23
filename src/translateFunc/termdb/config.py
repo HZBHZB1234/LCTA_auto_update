@@ -107,8 +107,14 @@ def aligned_units_path(mirror: Path) -> Path:
 
 
 def file_kind(rel: str) -> str:
-    """沿用 _diag_analysis/glossary_feasibility.py 的域分类。"""
-    base = rel.replace("\\", "/").split("/")[-1]
+    """沿用 _diag_analysis/glossary_feasibility.py 的域分类。
+
+    入口先归一化路径分隔符：调用方可能传 Windows 风格（``StoryData\\x.json``）
+    或 ``Path`` 的字符串形式，未归一化会让 ``startswith("StoryData/")`` 失配，
+    使剧情文件被误判成 ui_or_data（运行时 scope 与回流口径随即分叉）。
+    """
+    rel = str(rel or "").replace("\\", "/")
+    base = rel.split("/")[-1]
     if rel.startswith("StoryData/") or base.startswith(("AbDlg", "Story")):
         return "story"
     if base.startswith(("Skills", "Passives", "Bufs", "SkillTag", "BattleKeywords")):

@@ -1,7 +1,7 @@
 """工程化自 _diag_analysis/glossary_seeds.py：L0 结构名称对 + 冲突隔离 + 正文命中率。
 
 只读；输出 docs/termdb/preflight/glossary_seeds.json（确定性）。
-CLI: python -m tools.termdb.glossary_seeds [--repo PATH] [--out PATH]
+CLI: python -m translateFunc.termdb.glossary_seeds [--repo PATH] [--out PATH]
 """
 from __future__ import annotations
 

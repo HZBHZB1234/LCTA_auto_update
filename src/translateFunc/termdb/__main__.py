@@ -1,4 +1,4 @@
-"""tools.termdb 统一 CLI：python -m tools.termdb <subcommand>."""
+"""translateFunc.termdb 统一 CLI：python -m translateFunc.termdb <subcommand>."""
 from __future__ import annotations
 
 import hashlib
@@ -153,7 +153,7 @@ def cmd_terms_import_learned(root: Path, args) -> dict:
 
 def build_parser():
     import argparse
-    ap = argparse.ArgumentParser(prog="python -m tools.termdb",
+    ap = argparse.ArgumentParser(prog="python -m translateFunc.termdb",
                                  description="官方汉化语料固化 / 对齐 / 前置步骤")
     ap.add_argument("--root", default="", help="workspace 根目录（默认自动探测）")
     sub = ap.add_subparsers(dest="cmd", required=True)

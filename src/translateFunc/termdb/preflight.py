@@ -8,7 +8,7 @@
   preflight/glossary_reuse.json
   name_pairs_with_evidence.jsonl    ← L0 名称对 + (tag, commit, raw_token, 日期, blob, stale)
 
-CLI: python -m tools.termdb preflight [--repo PATH] [--skip-history]
+CLI: python -m translateFunc.termdb preflight [--repo PATH] [--skip-history]
 """
 from __future__ import annotations
 

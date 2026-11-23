@@ -3,7 +3,7 @@
 只读（git show / ls-tree）；输出 docs/termdb/preflight/glossary_history.json。
 BOM 改进：对 git show 返回的文本先 lstrip('\\ufeff') 再 json.loads，
 避免带 BOM 的历史 blob 被静默跳过（对应 plan §2.1 坑）。
-CLI: python -m tools.termdb.glossary_history [--repo PATH] [--per-commit N]
+CLI: python -m translateFunc.termdb.glossary_history [--repo PATH] [--per-commit N]
 """
 from __future__ import annotations
 

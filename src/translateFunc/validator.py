@@ -650,8 +650,12 @@ class TermLandingValidator:
             zh = str(t.get("translation", "") or t.get("cn", "") or "")
             if not (kr and zh) or len(kr) < 2:
                 continue
-            if "/" in zh or "／" in zh:
-                continue  # 多译名条目无法确定性判落位
+            try:
+                from translateFunc.termdb.terms_schema import is_multi_name_translation
+                if is_multi_name_translation(zh):
+                    continue  # 多译名条目无法确定性判落位
+            except Exception:  # noqa: BLE001
+                pass
             key = f"{t.get('entity_id', '')}|{t.get('sense', '')}"
             self._registry.append((key, kr, zh, tier))
             self._by_kr.setdefault(kr, t)
@@ -661,34 +665,32 @@ class TermLandingValidator:
         self._ac.build()
         self._registry.sort(key=lambda x: (-len(x[1]), x[1]))
 
-    def _hits(self, text: str, field: str, domain: str) -> set[str]:
-        """对单块文本做与运行时一致的最长匹配 + scope 过滤。"""
+    def _allowed(self, pattern: str, field: str) -> bool:
         from translateFunc.matcher.engine import scope_allows
 
-        if not text:
-            return set()
-        allowed: set[str] = set()
-        for pat in self._ac.search_non_overlapping(text):
-            item = self._by_kr.get(pat.pattern)
-            if item is not None and not scope_allows(item, domain=domain, field=field):
-                continue
-            allowed.add(pat.pattern)
-        return allowed
+        item = self._by_kr.get(pattern)
+        if item is None:
+            return True
+        return scope_allows(item, field=field)
 
     def check(self, text_blocks: list[dict], translations: list[str]) -> LandingReport:
         report = LandingReport()
         n = min(len(text_blocks), len(translations))
-        hits_by_block: dict[int, set[str]] = {}
+        # 单遍扫描：按块建 AC 命中倒排（term → 块号），避免 O(词条 × 块)。
+        hits_by_term: dict[str, list[int]] = {}
         for i in range(n):
             block = text_blocks[i] or {}
-            hits_by_block[i] = self._hits(
-                str(block.get("kr", "") or ""),
-                str(block.get("field", "") or ""),
-                str(block.get("domain", "") or ""),
-            )
+            src = str(block.get("kr", "") or "")
+            if not src:
+                continue
+            field = str(block.get("field", "") or "")
+            for pat in self._ac.search_non_overlapping(
+                src, allow=lambda p, f=field: self._allowed(p.pattern, f),
+            ):
+                hits_by_term.setdefault(pat.pattern, []).append(i + 1)
 
         for key, kr, zh, tier in self._registry:
-            hits = [i + 1 for i in range(n) if kr in hits_by_block[i]]
+            hits = hits_by_term.get(kr) or []
             if not hits:
                 report.observations.append(LandingObservation(
                     key, kr, zh, "none", note=f"tier={tier}"))

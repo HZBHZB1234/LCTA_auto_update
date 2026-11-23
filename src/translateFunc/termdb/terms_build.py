@@ -32,6 +32,18 @@ L1_MAX_SURFACES = 3000
 L1_MIN_LEN = 2
 L1_MAX_REPORT = 300
 
+# SkillTag 资产（BLACK/WHITE/AMBER/NAVY/...）的 KR 词面是**颜色名**，官方中文
+# 却是**罪种/属性名**（검정색→哀叹、흰색→疯狂、노란색→怠惰…）。这是同名不同
+# 语义的对齐，不是同义词；只能出现在名称字段，正文「흰색 옷」绝不能套「疯狂」。
+COLOR_TAG_TERMS = frozenset({
+    "검정색", "흰색", "노란색", "남색", "보라색",
+    "빨간색", "주황색", "초록색", "파란색",
+})
+
+# 仅为 title 字段出现过的词条：标题语境的译名（如 기사→司机、지도→地图）
+# 不适用于正文，统一降为 name_only，由运行时按字段挡在正文之外。
+TITLE_ONLY_FIELDS = frozenset({"title"})
+
 
 # --------------------------------------------------------------------------
 # L0：结构化名称入库
@@ -459,6 +471,7 @@ def build_flat_view(store: TermStore) -> list[dict]:
     """
     best: dict[str, tuple[float, str, dict]] = {}
     domains_by_kr: dict[str, set[str]] = defaultdict(set)
+    fields_by_kr: dict[str, set[str]] = defaultdict(set)
     for rec in store.all():
         if rec["tier"] not in (TIER_HARD, TIER_SOFT):
             continue
@@ -473,6 +486,9 @@ def build_flat_view(store: TermStore) -> list[dict]:
         for domain in scope.get("domains") or []:
             if domain:
                 domains_by_kr[kr].add(str(domain))
+        for field in scope.get("fields") or []:
+            if field:
+                fields_by_kr[kr].add(str(field))
         life = rec["lifecycle"]
         flat = {
             "term": kr,
@@ -501,6 +517,22 @@ def build_flat_view(store: TermStore) -> list[dict]:
         merged = domains_by_kr.get(key)
         if merged:
             flat["scope"]["domains"] = sorted(merged)
+        # 字段严格化（不改 match/tier，避免硬档被降成 soft）：
+        #   * 软档且全部证据只来自 title 字段 → 只在 title 类字段可见
+        #     （기사→司机 这类只在标题语境成立的译名不得进正文）；
+        #     硬档不套用：硬档标题多为地区/等级名（11구→11区），正文里通常
+        #     也能直接译对，限制反而降低连贯性；语法残片由前界校验兜底。
+        #   * SkillTag 颜色词 → 只在名称字段可见（흰색 옷 不得套「疯狂」）。
+        fields_union = fields_by_kr.get(key) or set()
+        if (
+            flat["tier"] == TIER_SOFT
+            and fields_union and fields_union <= TITLE_ONLY_FIELDS
+        ):
+            flat["scope"]["fields"] = sorted(TITLE_ONLY_FIELDS)
+            flat["scope"]["field_strict"] = True
+        elif key in COLOR_TAG_TERMS:
+            flat["scope"]["fields"] = list(flat["scope"].get("fields") or ["name"])
+            flat["scope"]["field_strict"] = True
         view.append(flat)
     return view
 

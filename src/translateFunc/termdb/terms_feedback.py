@@ -8,8 +8,10 @@ JSONL / proper_terms.json 重导出。全程无人工审批、无手动命令。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,9 @@ from .lib import flatten, read_json
 from .terms_store import DB_NAME, TermStore
 
 _logger = logging.getLogger("LCTA")
+
+# 回流幂等缓存：记录每个文件「上次观测时的 KR+译文内容哈希」
+_CACHE_FILE = ".feedback_cache.json"
 
 # 同一术语在多个文件里的观测聚合优先级：applied > partial > missing
 _RANK = {"applied": 0, "partial": 1, "missing": 2}
@@ -153,6 +158,11 @@ def run_feedback_loop(
     return report
 
 
+def _content_hash(kr_doc: Any, zh_doc: Any) -> str:
+    payload = json.dumps([kr_doc, zh_doc], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def run_pipeline_feedback(
     root: Path,
     source_output_pairs: list[tuple],
@@ -162,8 +172,22 @@ def run_pipeline_feedback(
 
     ``source_output_pairs`` 支持 ``(src, out)`` 或 ``(src, out, rel)``；
     带 ``rel`` 时按语料域执行术语 scope，与运行时同口径。
+
+    **内容级幂等**：同一 (KR, 译文) 内容只观测一次，结果记在
+    ``docs/termdb/.feedback_cache.json``。否则每轮流水线都会把磁盘上
+    全部已有译文重新判一次 missing，连续 3 轮就能把正确术语降到
+    conflict（审查 F1 blocker）。
     """
+    cache_path = config.artifact_dir(root) / _CACHE_FILE
+    try:
+        cache: dict[str, str] = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:  # noqa: BLE001 - 缓存损坏按空处理
+        cache = {}
+
     pairs: list[tuple[list[dict], list[str]]] = []
+    unchanged = 0
     for item in source_output_pairs:
         src, out = item[0], item[1]
         rel = str(item[2]) if len(item) > 2 else ""
@@ -173,14 +197,34 @@ def run_pipeline_feedback(
         except Exception as exc:  # noqa: BLE001 - 单文件失败不影响整体
             _logger.debug(f"落位回流跳过 {src}: {exc}")
             continue
+        digest = _content_hash(kr_doc, zh_doc)
+        key = rel or str(src)
+        if cache.get(key) == digest:
+            unchanged += 1
+            continue
+        cache[key] = digest
         domain = config.file_kind(rel) if rel else ""
         pairs.append(pair_blocks_translations(kr_doc, zh_doc, rel=rel, domain=domain))
+
+    if not pairs:
+        return {"landing_records": 0, "skipped": True, "skipped_unchanged": unchanged}
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_name(cache_path.name + ".tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, cache_path)
+    except Exception as exc:  # noqa: BLE001 - 缓存写失败只影响幂等，不影响回流
+        _logger.debug(f"落位回流缓存写入失败: {exc}")
+
     records = collect_landing_records(pairs, proper_terms)
     if not records:
-        return {"landing_records": 0, "skipped": True}
+        return {"landing_records": 0, "skipped": True, "skipped_unchanged": unchanged}
     result = run_feedback_loop(root, records)
+    result["skipped_unchanged"] = unchanged
     _logger.info(
         f"落位自动回流：观测 {result['landing_records']} 条，"
+        f"未变化跳过 {unchanged} 个文件，"
         f"状态变更 {result['state_changes']} 条，"
         f"兼容视图重导出 {result.get('flat_count', 0)} 条"
     )

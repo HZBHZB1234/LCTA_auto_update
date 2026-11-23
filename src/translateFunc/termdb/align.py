@@ -357,7 +357,7 @@ def render_markdown(report: dict) -> str:
     lines = [
         "# 官方汉化语料对齐报告",
         "",
-        f"> 生成器：`tools.termdb.align` · schema `{report['schema']}`",
+        f"> 生成器：`translateFunc.termdb.align` · schema `{report['schema']}`",
         "",
         "## 快照身份（证据链锚点）",
         "",
@@ -414,8 +414,8 @@ def render_markdown(report: dict) -> str:
         "## 可复现",
         "",
         "```powershell",
-        "python -m tools.termdb all",
-        "python -m tools.termdb verify   # 重跑比对产物哈希，确认幂等",
+        "python -m translateFunc.termdb all",
+        "python -m translateFunc.termdb verify   # 重跑比对产物哈希，确认幂等",
         "```",
         "",
     ]

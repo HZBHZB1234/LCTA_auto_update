@@ -1,7 +1,7 @@
 """工程化自 _diag_analysis/glossary_unknown.py：未翻译专名信号与种子覆盖率。
 
 只读；输出 docs/termdb/preflight/glossary_unknown.json（确定性）。
-CLI: python -m tools.termdb.glossary_unknown [--repo PATH] [--out PATH]
+CLI: python -m translateFunc.termdb.glossary_unknown [--repo PATH] [--out PATH]
 """
 from __future__ import annotations
 

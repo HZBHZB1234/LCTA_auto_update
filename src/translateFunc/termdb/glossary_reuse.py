@@ -1,7 +1,7 @@
 """工程化自 _diag_analysis/glossary_reuse.py：积压可复用率（0 次模型调用）。
 
 只读；输出 docs/termdb/preflight/glossary_reuse.json（确定性）。
-CLI: python -m tools.termdb.glossary_reuse [--repo PATH] [--out PATH]
+CLI: python -m translateFunc.termdb.glossary_reuse [--repo PATH] [--out PATH]
 """
 from __future__ import annotations
 

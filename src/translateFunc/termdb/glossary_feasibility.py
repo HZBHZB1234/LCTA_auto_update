@@ -1,7 +1,7 @@
 """工程化自 _diag_analysis/glossary_feasibility.py：文件/单元/未翻译/去重/占位符统计。
 
 只读；输出 docs/termdb/preflight/glossary_feasibility.json（确定性）。
-CLI: python -m tools.termdb.glossary_feasibility [--repo PATH] [--out PATH]
+CLI: python -m translateFunc.termdb.glossary_feasibility [--repo PATH] [--out PATH]
 """
 from __future__ import annotations
 

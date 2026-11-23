@@ -118,7 +118,11 @@ class AcAutomaton:
         return spans
 
     def search_non_overlapping(
-        self, text: str, *, hangul_short_boundary: bool = True,
+        self,
+        text: str,
+        *,
+        hangul_short_boundary: bool = True,
+        allow=None,
     ) -> list[ACPattern]:
         """最长匹配优先的不重叠命中集合（用于术语注入，避免子串碰撞）。
 
@@ -131,8 +135,8 @@ class AcAutomaton:
         ``지도``（地图）。只看前界、不看后界：韩文助词紧贴词干
         （``기사에게``、``K사가``），后界校验会误杀正常命中。
 
-        纯拉丁/含数字/引号包裹的词面（``K사``、``[Bleed]``、``「적응」``）不参与
-        前界校验。
+        ``allow``：可选的词条准入谓词，在去重叠**之前**执行。顺序很重要——
+        先过滤再占位，被挡掉的长词才不会占住区间、把合法短词一起吞掉。
         """
         spans = self.search_spans(text)
         if not spans:
@@ -140,6 +144,8 @@ class AcAutomaton:
         chosen: list[ACPattern] = []
         occupied: list[tuple[int, int]] = []
         for start, end, pat in sorted(spans, key=lambda s: (s[0], -(s[1] - s[0]))):
+            if allow is not None and not allow(pat):
+                continue
             if any(start < used_end and end > used_start
                    for used_start, used_end in occupied):
                 continue

@@ -16,6 +16,27 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 
+# 多译名检测：分隔符两侧都必须是「词」，且整体不是富文本标签。
+# 反例：`<s>中指</s>` 的 `/` 是闭合标签，不是多译名分隔符。
+_SLASH_SPLIT = re.compile(r"\s*[/／]\s*")
+_CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+_MAX_NAME_PART = 16
+
+
+def is_multi_name_translation(cn: str) -> bool:
+    """中文是否为「A/B」多译名条目（无法确定该用哪一支）。"""
+    text = str(cn or "").strip()
+    if not text or "<" in text or ">" in text:
+        return False
+    if "/" not in text and "／" not in text:
+        return False
+    parts = [p for p in _SLASH_SPLIT.split(text) if p]
+    if len(parts) < 2:
+        return False
+    if any(len(p) > _MAX_NAME_PART or not _CJK.search(p) for p in parts):
+        return False
+    return True
+
 # ---- 档位（score 决定"怎么用"，不决定"记不记录"）----
 TIER_HARD = "hard"          # score >= 0.80：进强制区，译文必须落位
 TIER_SOFT = "soft"          # 0.55 <= score < 0.80：只进提示区
